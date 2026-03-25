@@ -50,6 +50,19 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_contacts_phone ON contacts(phone);
   CREATE INDEX IF NOT EXISTS idx_contacts_last_seen ON contacts(last_seen);
   CREATE INDEX IF NOT EXISTS idx_contact_groups_group ON contact_groups(group_id);
+
+  CREATE TABLE IF NOT EXISTS broadcast_lists (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS broadcast_list_members (
+    list_id TEXT NOT NULL,
+    jid TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (list_id, jid),
+    FOREIGN KEY (list_id) REFERENCES broadcast_lists(id) ON DELETE CASCADE
+  );
 `);
 
 // Prepared statements for performance
@@ -126,6 +139,33 @@ const stmts = {
       COUNT(CASE WHEN last_seen >= date('now') THEN 1 END) as today,
       COUNT(CASE WHEN last_seen >= date('now', '-7 days') THEN 1 END) as week
     FROM contacts
+  `),
+  // Broadcast lists
+  createList: db.prepare(`INSERT INTO broadcast_lists (id, name, created_at) VALUES (?, ?, ?)`),
+  deleteList: db.prepare(`DELETE FROM broadcast_lists WHERE id = ?`),
+  renameList: db.prepare(`UPDATE broadcast_lists SET name = ? WHERE id = ?`),
+  allLists: db.prepare(`
+    SELECT bl.*, COUNT(blm.jid) as member_count
+    FROM broadcast_lists bl
+    LEFT JOIN broadcast_list_members blm ON bl.id = blm.list_id
+    GROUP BY bl.id ORDER BY bl.created_at DESC
+  `),
+  listMembers: db.prepare(`
+    SELECT c.*, blm.added_at, GROUP_CONCAT(DISTINCT ct.tag) as tags
+    FROM broadcast_list_members blm
+    INNER JOIN contacts c ON blm.jid = c.jid
+    LEFT JOIN contact_tags ct ON c.jid = ct.jid
+    WHERE blm.list_id = ?
+    GROUP BY c.jid ORDER BY c.name
+  `),
+  addListMember: db.prepare(`INSERT OR IGNORE INTO broadcast_list_members (list_id, jid, added_at) VALUES (?, ?, ?)`),
+  removeListMember: db.prepare(`DELETE FROM broadcast_list_members WHERE list_id = ? AND jid = ?`),
+  bulkUpsertContact: db.prepare(`
+    INSERT INTO contacts (jid, phone, name, first_seen, last_seen, message_count, interests)
+    VALUES (@jid, @phone, @name, @now, @now, 0, '[]')
+    ON CONFLICT(jid) DO UPDATE SET
+      name = CASE WHEN @name != '' THEN @name ELSE contacts.name END,
+      last_seen = @now
   `),
 };
 
@@ -607,6 +647,120 @@ function handleExportContacts(groupId) {
   return header + '\n' + csvRows.join('\n');
 }
 
+// ── Broadcast List Handlers ──────────────────────────────────────────────────
+function handleGetLists() {
+  return { lists: stmts.allLists.all() };
+}
+
+function handleCreateList(body) {
+  const id = 'bl-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const name = (body.name || 'New List').trim();
+  stmts.createList.run(id, name, new Date().toISOString());
+  return { id, name };
+}
+
+function handleDeleteList(id) {
+  stmts.deleteList.run(id);
+  return { ok: true };
+}
+
+function handleRenameList(body) {
+  stmts.renameList.run(body.name, body.id);
+  return { ok: true };
+}
+
+function handleGetListMembers(listId) {
+  const rows = stmts.listMembers.all(listId);
+  return { members: enrichContacts(rows) };
+}
+
+function handleAddListMembers(body) {
+  const { listId, jids } = body;
+  if (!listId || !jids || !Array.isArray(jids)) return { error: 'Missing listId or jids' };
+  const now = new Date().toISOString();
+  const txn = db.transaction(() => {
+    for (const jid of jids) {
+      stmts.addListMember.run(listId, jid, now);
+    }
+  });
+  txn();
+  return { ok: true, added: jids.length };
+}
+
+function handleRemoveListMember(body) {
+  stmts.removeListMember.run(body.listId, body.jid);
+  return { ok: true };
+}
+
+async function handleBroadcastToList(body) {
+  const { listId, message } = body;
+  if (!listId || !message) return { error: 'Missing listId or message' };
+
+  const members = stmts.listMembers.all(listId);
+  if (!members.length) return { error: 'List is empty' };
+
+  // Find a connected socket
+  let sock = null;
+  for (const [, acc] of accounts) {
+    if (acc.status === 'ready' && acc.sock) { sock = acc.sock; break; }
+  }
+  if (!sock) return { error: 'No connected WhatsApp account' };
+
+  let sent = 0, failed = 0;
+  const results = [];
+  for (const member of members) {
+    const phone = member.phone || member.jid.split('@')[0];
+    const dmJid = phone + '@s.whatsapp.net';
+    try {
+      await sock.sendMessage(dmJid, { text: message });
+      sent++;
+      results.push({ phone, ok: true });
+    } catch (e) {
+      failed++;
+      results.push({ phone, ok: false, error: e.message });
+    }
+    await new Promise(r => setTimeout(r, 500)); // slower for DMs to avoid bans
+  }
+  return { sent, failed, total: members.length, results };
+}
+
+// ── CSV Import Handler ──────────────────────────────────────────────────────
+function handleImportCSV(body) {
+  const { contacts: rows, listId } = body;
+  if (!rows || !Array.isArray(rows)) return { error: 'Missing contacts array' };
+
+  const now = new Date().toISOString();
+  let imported = 0, skipped = 0;
+
+  const txn = db.transaction(() => {
+    for (const row of rows) {
+      let phone = (row.phone || row.Phone || row.number || row.Number || '').toString().replace(/[^0-9+]/g, '');
+      if (!phone || phone.length < 7) { skipped++; continue; }
+      // Normalize: remove leading + for JID
+      const cleanPhone = phone.replace(/^\+/, '');
+      const jid = cleanPhone + '@s.whatsapp.net';
+      const name = row.name || row.Name || row.first_name || row.FirstName || '';
+
+      stmts.bulkUpsertContact.run({ jid, phone: cleanPhone, name, now });
+
+      // Auto-tag as imported
+      stmts.addTag.run({ jid, tag: 'imported' });
+      if (row.tag || row.Tag) stmts.addTag.run({ jid, tag: row.tag || row.Tag });
+      if (row.source || row.Source) stmts.addTag.run({ jid, tag: 'source:' + (row.source || row.Source) });
+
+      // Add to list if specified
+      if (listId) {
+        stmts.addListMember.run(listId, jid, now);
+      }
+
+      imported++;
+    }
+  });
+  txn();
+
+  return { ok: true, imported, skipped, total: rows.length };
+}
+
 // ── HTML UI v3 ──────────────────────────────────────────────────────────────
 const HTML = `<!DOCTYPE html>
 <html lang="en" dir="ltr">
@@ -784,6 +938,23 @@ const HTML = `<!DOCTYPE html>
     .contact-score.hot { background: #dc262620; color: #dc2626; }
     .contact-score.warm { background: #f59e0b20; color: #f59e0b; }
     .contact-score.cold { background: #2a3942; color: #8696a0; }
+
+    /* List cards */
+    .list-card { background: #1f2c34; border-radius: 8px; padding: 12px; margin-bottom: 8px; display: flex; align-items: center; gap: 10px; cursor: pointer; transition: background 0.1s; }
+    .list-card:hover { background: #253540; }
+    .list-icon { width: 42px; height: 42px; background: #005c4b; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; }
+    .list-info { flex: 1; min-width: 0; }
+    .list-name { font-size: 15px; color: #e9edef; }
+    .list-meta { font-size: 11px; color: #8696a0; margin-top: 2px; }
+    .list-actions { display: flex; gap: 4px; }
+    .list-del { background: none; border: none; color: #8696a0; font-size: 14px; cursor: pointer; padding: 4px; }
+    .list-del:hover { color: #f15c6d; }
+
+    /* Add members modal */
+    .add-members-list { max-height: 300px; overflow-y: auto; }
+    .add-member-item { display: flex; align-items: center; gap: 8px; padding: 8px; border-bottom: 1px solid #222e35; cursor: pointer; }
+    .add-member-item:hover { background: #222e35; }
+    .add-member-item input[type=checkbox] { accent-color: #00a884; width: 16px; height: 16px; }
   </style>
 </head>
 <body>
@@ -808,6 +979,7 @@ const HTML = `<!DOCTYPE html>
       <button class="tab-btn" onclick="switchTab('leads')" id="tabLeads">&#x1F50D; Leads <span class="badge" id="leadBadge" style="display:none">0</span></button>
       <button class="tab-btn" onclick="switchTab('keywords')" id="tabKeywords">&#x2699; Keywords</button>
       <button class="tab-btn" onclick="switchTab('contacts')" id="tabContacts">&#x1F464; Contacts <span class="badge" id="contactBadge" style="display:none">0</span></button>
+      <button class="tab-btn" onclick="switchTab('lists')" id="tabLists">&#x1F4CB; Lists</button>
     </div>
 
     <!-- QR Modal -->
@@ -947,6 +1119,56 @@ const HTML = `<!DOCTYPE html>
         </div>
 
         <div id="contactsList"></div>
+
+        <!-- CSV Import -->
+        <div class="bubble" style="margin-top:12px">
+          <div class="bubble-label">Import Contacts (CSV)</div>
+          <p style="font-size:12px;color:#8696a0;margin-bottom:8px">CSV must have a <strong>phone</strong> column. Optional: name, tag, source</p>
+          <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px">
+            <input type="file" id="csvFileInput" accept=".csv" style="font-size:12px;color:#8696a0;flex:1" />
+            <select id="csvTargetList" style="background:#2a3942;border:none;color:#e9edef;border-radius:8px;padding:6px 8px;font-size:12px">
+              <option value="">No list</option>
+            </select>
+          </div>
+          <button class="kw-add-btn" onclick="importCSV()">&#x1F4E4; Import</button>
+          <div id="importResult" style="font-size:12px;margin-top:6px;display:none"></div>
+        </div>
+      </div>
+
+      <!-- ═══ LISTS TAB ═══ -->
+      <div class="tab-content" id="panelLists">
+        <div style="display:flex;gap:6px;margin-bottom:12px">
+          <input type="text" id="newListName" placeholder="New broadcast list name..." style="flex:1;border-radius:20px;padding:8px 14px;font-size:13px" onkeydown="if(event.key==='Enter')createList()" />
+          <button class="kw-add-btn" onclick="createList()">+ Create</button>
+        </div>
+
+        <div id="listsContainer"></div>
+
+        <!-- Active list view -->
+        <div id="listDetail" style="display:none">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <div>
+              <div class="bubble-label" style="margin:0" id="listDetailName"></div>
+              <div style="font-size:11px;color:#8696a0" id="listDetailCount"></div>
+            </div>
+            <div style="display:flex;gap:6px">
+              <button class="wa-icon-btn" onclick="addMembersToList()">+ Add contacts</button>
+              <button class="wa-icon-btn" onclick="closeListDetail()">&#x2190; Back</button>
+            </div>
+          </div>
+
+          <!-- Broadcast to list -->
+          <div class="bubble" style="margin-bottom:8px">
+            <div class="bubble-label">Broadcast DM to list</div>
+            <textarea id="listBroadcastMsg" rows="2" style="min-height:60px" placeholder="Type message to DM all members..."></textarea>
+            <div style="display:flex;gap:6px;margin-top:8px;align-items:center">
+              <button class="kw-add-btn" onclick="broadcastToList()" id="listSendBtn">&#x1F4E4; Send DMs</button>
+              <span id="listSendResult" style="font-size:12px;color:#8696a0"></span>
+            </div>
+          </div>
+
+          <div id="listMembersList"></div>
+        </div>
       </div>
     </div>
 
@@ -1006,6 +1228,22 @@ const HTML = `<!DOCTYPE html>
         <div class="modal-actions">
           <button class="modal-close" onclick="closeDM()">Cancel</button>
           <button class="reply-send" onclick="sendDM()">Send</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Add Members Modal -->
+    <div class="modal-overlay" id="addMembersModal" style="display:none">
+      <div class="modal" style="max-width:400px;text-align:left">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+          <h3 style="font-size:15px">Add Contacts to List</h3>
+          <button class="modal-close" onclick="closeAddMembers()" style="padding:4px 12px">&#x2715;</button>
+        </div>
+        <input type="text" id="addMemberSearch" placeholder="Search contacts..." oninput="searchAddMembers()" style="margin-bottom:8px;border-radius:20px;padding:8px 12px;font-size:13px" />
+        <div class="add-members-list" id="addMembersList"></div>
+        <div style="display:flex;justify-content:flex-end;gap:6px;margin-top:12px">
+          <button class="modal-close" onclick="closeAddMembers()">Cancel</button>
+          <button class="reply-send" onclick="confirmAddMembers()">Add Selected</button>
         </div>
       </div>
     </div>
@@ -1125,6 +1363,7 @@ const HTML = `<!DOCTYPE html>
       if (tab === 'leads') { loadLeads(); loadLeadStats(); }
       if (tab === 'keywords') { loadKeywords(); }
       if (tab === 'contacts') { loadContacts(); }
+      if (tab === 'lists') { loadLists(); }
     }
 
     // ── Accounts ──
@@ -1615,6 +1854,254 @@ const HTML = `<!DOCTYPE html>
         a.click(); URL.revokeObjectURL(a.href);
       } catch (e) { alert('Export error: ' + e.message); }
     }
+
+    // ── CSV Import ──
+    function parseCSV(text) {
+      var lines = text.split(/\\r?\\n/).filter(function(l) { return l.trim(); });
+      if (lines.length < 2) return [];
+      var headers = lines[0].split(',').map(function(h) { return h.trim().replace(/^"|"$/g, ''); });
+      var rows = [];
+      for (var i = 1; i < lines.length; i++) {
+        var vals = lines[i].match(/("(?:[^"]|"")*"|[^,]*)/g) || [];
+        var obj = {};
+        headers.forEach(function(h, idx) {
+          obj[h] = (vals[idx] || '').trim().replace(/^"|"$/g, '').replace(/""/g, '"');
+        });
+        rows.push(obj);
+      }
+      return rows;
+    }
+
+    async function importCSV() {
+      var fileInput = document.getElementById('csvFileInput');
+      var resultEl = document.getElementById('importResult');
+      if (!fileInput.files || !fileInput.files[0]) { alert('Select a CSV file first'); return; }
+
+      var listId = document.getElementById('csvTargetList').value || undefined;
+
+      resultEl.style.display = 'block';
+      resultEl.style.color = '#8696a0';
+      resultEl.textContent = 'Reading file...';
+
+      var reader = new FileReader();
+      reader.onload = async function(e) {
+        var rows = parseCSV(e.target.result);
+        if (!rows.length) { resultEl.textContent = 'No valid rows found'; resultEl.style.color = '#f15c6d'; return; }
+
+        resultEl.textContent = 'Importing ' + rows.length + ' contacts...';
+        try {
+          var r = await fetch('/api/contacts/import', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ contacts: rows, listId: listId })
+          });
+          var d = await r.json();
+          if (d.ok) {
+            resultEl.style.color = '#00a884';
+            resultEl.textContent = 'Imported ' + d.imported + ' contacts' + (d.skipped ? ', skipped ' + d.skipped : '');
+            loadContacts();
+          } else {
+            resultEl.style.color = '#f15c6d';
+            resultEl.textContent = 'Error: ' + (d.error || 'Unknown');
+          }
+        } catch (err) { resultEl.style.color = '#f15c6d'; resultEl.textContent = 'Error: ' + err.message; }
+      };
+      reader.readAsText(fileInput.files[0]);
+    }
+
+    // ── Broadcast Lists ──
+    var allLists = [];
+    var activeListId = null;
+    var addMemberSelected = new Set();
+
+    async function loadLists() {
+      try {
+        var r = await fetch('/api/lists');
+        var d = await r.json();
+        allLists = d.lists || [];
+        renderLists();
+        updateCSVListDropdown();
+      } catch (e) {}
+    }
+
+    function renderLists() {
+      var el = document.getElementById('listsContainer');
+      if (document.getElementById('listDetail').style.display !== 'none') return;
+      if (!allLists.length) {
+        el.innerHTML = '<div class="empty">&#x1F4CB; No broadcast lists yet. Create one above.</div>';
+        return;
+      }
+      el.innerHTML = allLists.map(function(l) {
+        return '<div class="list-card" onclick="openList(\\'' + l.id + '\\')">'
+          + '<div class="list-icon">&#x1F4E2;</div>'
+          + '<div class="list-info"><div class="list-name">' + esc(l.name) + '</div>'
+          + '<div class="list-meta">' + l.member_count + ' contacts &middot; Created ' + new Date(l.created_at).toLocaleDateString() + '</div></div>'
+          + '<div class="list-actions"><button class="list-del" onclick="event.stopPropagation();deleteList(\\'' + l.id + '\\')" title="Delete">&#x1F5D1;</button></div>'
+          + '</div>';
+      }).join('');
+    }
+
+    function updateCSVListDropdown() {
+      var sel = document.getElementById('csvTargetList');
+      sel.innerHTML = '<option value="">No list</option>' + allLists.map(function(l) {
+        return '<option value="' + l.id + '">' + esc(l.name) + '</option>';
+      }).join('');
+    }
+
+    async function createList() {
+      var input = document.getElementById('newListName');
+      var name = input.value.trim();
+      if (!name) return;
+      try {
+        await fetch('/api/lists', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name }) });
+        input.value = '';
+        loadLists();
+      } catch (e) {}
+    }
+
+    async function deleteList(id) {
+      if (!confirm('Delete this broadcast list?')) return;
+      try {
+        await fetch('/api/lists?id=' + encodeURIComponent(id), { method: 'DELETE' });
+        if (activeListId === id) closeListDetail();
+        loadLists();
+      } catch (e) {}
+    }
+
+    async function openList(id) {
+      activeListId = id;
+      var list = allLists.find(function(l) { return l.id === id; });
+      document.getElementById('listDetailName').textContent = list ? list.name : 'List';
+      document.getElementById('listsContainer').style.display = 'none';
+      document.getElementById('newListName').parentElement.style.display = 'none';
+      document.getElementById('listDetail').style.display = 'block';
+      document.getElementById('listBroadcastMsg').value = '';
+      document.getElementById('listSendResult').textContent = '';
+      loadListMembers();
+    }
+
+    function closeListDetail() {
+      activeListId = null;
+      document.getElementById('listDetail').style.display = 'none';
+      document.getElementById('listsContainer').style.display = '';
+      document.getElementById('newListName').parentElement.style.display = 'flex';
+      renderLists();
+    }
+
+    async function loadListMembers() {
+      if (!activeListId) return;
+      try {
+        var r = await fetch('/api/lists/members?id=' + encodeURIComponent(activeListId));
+        var d = await r.json();
+        var members = d.members || [];
+        document.getElementById('listDetailCount').textContent = members.length + ' contacts';
+        var el = document.getElementById('listMembersList');
+        if (!members.length) { el.innerHTML = '<div class="empty">No members yet. Click "+ Add contacts" to add some.</div>'; return; }
+        el.innerHTML = members.map(function(c) {
+          var initial = (c.name || c.phone || '?').charAt(0).toUpperCase();
+          return '<div class="contact-card">'
+            + '<div class="contact-avatar ' + c.activityLevel + '">' + initial + '</div>'
+            + '<div class="contact-info" onclick="openContact(\\'' + c.jid.replace(/'/g, "\\\\'") + '\\')">'
+            + '<div class="contact-name">' + esc(c.name || c.phone) + '</div>'
+            + '<div class="contact-meta"><span>&#x1F4F1; ' + esc(c.phone) + '</span><span>&#x1F525; ' + c.activityScore + '</span></div></div>'
+            + '<button class="list-del" onclick="removeMember(\\'' + c.jid.replace(/'/g, "\\\\'") + '\\')" title="Remove">&#x2715;</button>'
+            + '</div>';
+        }).join('');
+      } catch (e) {}
+    }
+
+    async function removeMember(jid) {
+      if (!activeListId) return;
+      try {
+        await fetch('/api/lists/members', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ listId: activeListId, jid: jid }) });
+        loadListMembers();
+      } catch (e) {}
+    }
+
+    async function addMembersToList() {
+      addMemberSelected = new Set();
+      document.getElementById('addMemberSearch').value = '';
+      document.getElementById('addMembersModal').style.display = 'flex';
+      // Load all contacts
+      try {
+        var r = await fetch('/api/contacts?limit=200');
+        var d = await r.json();
+        renderAddMembers(d.contacts || []);
+      } catch (e) {}
+    }
+
+    function renderAddMembers(list) {
+      var el = document.getElementById('addMembersList');
+      el.innerHTML = list.map(function(c) {
+        var checked = addMemberSelected.has(c.jid) ? 'checked' : '';
+        return '<div class="add-member-item" onclick="toggleAddMember(\\'' + c.jid.replace(/'/g, "\\\\'") + '\\')">'
+          + '<input type="checkbox" ' + checked + ' onclick="event.stopPropagation();toggleAddMember(\\'' + c.jid.replace(/'/g, "\\\\'") + '\\')">'
+          + '<span style="font-size:14px">' + esc(c.name || c.phone) + '</span>'
+          + '<span style="font-size:11px;color:#8696a0;margin-left:auto">' + esc(c.phone) + '</span>'
+          + '</div>';
+      }).join('') || '<div class="empty">No contacts</div>';
+    }
+
+    function toggleAddMember(jid) {
+      if (addMemberSelected.has(jid)) addMemberSelected.delete(jid); else addMemberSelected.add(jid);
+      // Re-render checkboxes
+      document.querySelectorAll('#addMembersList .add-member-item').forEach(function(el) {
+        var cb = el.querySelector('input[type=checkbox]');
+        var elJid = el.getAttribute('onclick').match(/'([^']+)'/);
+        if (elJid && elJid[1]) cb.checked = addMemberSelected.has(elJid[1]);
+      });
+    }
+
+    var addMemberSearchTimeout = null;
+    function searchAddMembers() {
+      clearTimeout(addMemberSearchTimeout);
+      addMemberSearchTimeout = setTimeout(async function() {
+        var q = document.getElementById('addMemberSearch').value.trim();
+        try {
+          var url = q ? '/api/contacts?q=' + encodeURIComponent(q) : '/api/contacts?limit=200';
+          var r = await fetch(url);
+          var d = await r.json();
+          renderAddMembers(d.contacts || []);
+        } catch (e) {}
+      }, 300);
+    }
+
+    function closeAddMembers() { document.getElementById('addMembersModal').style.display = 'none'; }
+
+    async function confirmAddMembers() {
+      if (!activeListId || addMemberSelected.size === 0) { alert('Select at least one contact'); return; }
+      try {
+        await fetch('/api/lists/members', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ listId: activeListId, jids: Array.from(addMemberSelected) })
+        });
+        closeAddMembers();
+        loadListMembers();
+      } catch (e) {}
+    }
+
+    async function broadcastToList() {
+      var msg = document.getElementById('listBroadcastMsg').value.trim();
+      if (!msg || !activeListId) return;
+      var btn = document.getElementById('listSendBtn');
+      var result = document.getElementById('listSendResult');
+      btn.disabled = true;
+      result.textContent = 'Sending DMs...';
+      result.style.color = '#8696a0';
+      try {
+        var r = await fetch('/api/lists/broadcast', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ listId: activeListId, message: msg })
+        });
+        var d = await r.json();
+        if (d.error) { result.textContent = 'Error: ' + d.error; result.style.color = '#f15c6d'; }
+        else {
+          result.style.color = '#00a884';
+          result.textContent = 'Sent: ' + d.sent + (d.failed ? ' | Failed: ' + d.failed : '');
+        }
+      } catch (e) { result.textContent = 'Error: ' + e.message; result.style.color = '#f15c6d'; }
+      btn.disabled = false;
+    }
   </script>
 </body>
 </html>`;
@@ -1734,6 +2221,41 @@ const server = http.createServer(async (req, res) => {
     const csv = handleExportContacts(params.get('group'));
     res.writeHead(200, { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="contacts.csv"' });
     res.end(csv); return;
+  }
+  if (p === '/api/contacts/import' && req.method === 'POST') {
+    try { const body = await readBody(req, 10485760); json(res, handleImportCSV(JSON.parse(body))); }
+    catch (e) { json(res, { error: e.message }, 500); } return;
+  }
+
+  // Broadcast list routes
+  if (p === '/api/lists' && req.method === 'GET') { json(res, handleGetLists()); return; }
+  if (p === '/api/lists' && req.method === 'POST') {
+    try { const body = await readBody(req); json(res, handleCreateList(JSON.parse(body))); }
+    catch (e) { json(res, { error: e.message }, 500); } return;
+  }
+  if (p === '/api/lists' && req.method === 'DELETE') {
+    const id = params.get('id');
+    if (!id) { json(res, { error: 'Missing id' }, 400); return; }
+    json(res, handleDeleteList(id)); return;
+  }
+  if (p === '/api/lists/rename' && req.method === 'PUT') {
+    try { const body = await readBody(req); json(res, handleRenameList(JSON.parse(body))); }
+    catch (e) { json(res, { error: e.message }, 500); } return;
+  }
+  if (p === '/api/lists/members' && req.method === 'GET') {
+    json(res, handleGetListMembers(params.get('id'))); return;
+  }
+  if (p === '/api/lists/members' && req.method === 'POST') {
+    try { const body = await readBody(req); json(res, handleAddListMembers(JSON.parse(body))); }
+    catch (e) { json(res, { error: e.message }, 500); } return;
+  }
+  if (p === '/api/lists/members' && req.method === 'DELETE') {
+    try { const body = await readBody(req); json(res, handleRemoveListMember(JSON.parse(body))); }
+    catch (e) { json(res, { error: e.message }, 500); } return;
+  }
+  if (p === '/api/lists/broadcast' && req.method === 'POST') {
+    try { const body = await readBody(req); json(res, await handleBroadcastToList(JSON.parse(body))); }
+    catch (e) { json(res, { error: e.message }, 500); } return;
   }
 
   res.writeHead(404); res.end('Not found');
