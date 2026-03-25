@@ -7,9 +7,155 @@ const fs = require('fs');
 const path = require('path');
 const pino = require('pino');
 
+const Database = require('better-sqlite3');
+
 const PORT = process.env.PORT || 3050;
 const BASE_SESSION_DIR = path.resolve('./wa-session');
+const DATA_DIR = path.resolve('./data');
 const logger = pino({ level: 'silent' });
+
+// ── SQLite Database ─────────────────────────────────────────────────────────
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+const db = new Database(path.join(DATA_DIR, 'contacts.db'));
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS contacts (
+    jid TEXT PRIMARY KEY,
+    phone TEXT NOT NULL,
+    name TEXT DEFAULT '',
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    message_count INTEGER DEFAULT 1,
+    interests TEXT DEFAULT '[]',
+    notes TEXT DEFAULT ''
+  );
+  CREATE TABLE IF NOT EXISTS contact_groups (
+    jid TEXT NOT NULL,
+    group_id TEXT NOT NULL,
+    group_name TEXT DEFAULT '',
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    message_count INTEGER DEFAULT 1,
+    PRIMARY KEY (jid, group_id),
+    FOREIGN KEY (jid) REFERENCES contacts(jid) ON DELETE CASCADE
+  );
+  CREATE TABLE IF NOT EXISTS contact_tags (
+    jid TEXT NOT NULL,
+    tag TEXT NOT NULL,
+    PRIMARY KEY (jid, tag),
+    FOREIGN KEY (jid) REFERENCES contacts(jid) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_contacts_phone ON contacts(phone);
+  CREATE INDEX IF NOT EXISTS idx_contacts_last_seen ON contacts(last_seen);
+  CREATE INDEX IF NOT EXISTS idx_contact_groups_group ON contact_groups(group_id);
+`);
+
+// Prepared statements for performance
+const stmts = {
+  upsertContact: db.prepare(`
+    INSERT INTO contacts (jid, phone, name, first_seen, last_seen, message_count, interests)
+    VALUES (@jid, @phone, @name, @now, @now, 1, '[]')
+    ON CONFLICT(jid) DO UPDATE SET
+      name = CASE WHEN @name != '' THEN @name ELSE contacts.name END,
+      last_seen = @now,
+      message_count = contacts.message_count + 1
+  `),
+  upsertContactGroup: db.prepare(`
+    INSERT INTO contact_groups (jid, group_id, group_name, first_seen, last_seen, message_count)
+    VALUES (@jid, @groupId, @groupName, @now, @now, 1)
+    ON CONFLICT(jid, group_id) DO UPDATE SET
+      group_name = @groupName,
+      last_seen = @now,
+      message_count = contact_groups.message_count + 1
+  `),
+  addTag: db.prepare(`INSERT OR IGNORE INTO contact_tags (jid, tag) VALUES (@jid, @tag)`),
+  removeTag: db.prepare(`DELETE FROM contact_tags WHERE jid = @jid AND tag = @tag`),
+  getContact: db.prepare(`SELECT * FROM contacts WHERE jid = ?`),
+  getContactGroups: db.prepare(`SELECT * FROM contact_groups WHERE jid = ? ORDER BY last_seen DESC`),
+  getContactTags: db.prepare(`SELECT tag FROM contact_tags WHERE jid = ?`),
+  updateInterests: db.prepare(`UPDATE contacts SET interests = @interests WHERE jid = @jid`),
+  updateNotes: db.prepare(`UPDATE contacts SET notes = @notes WHERE jid = @jid`),
+  deleteContact: db.prepare(`DELETE FROM contacts WHERE jid = ?`),
+  totalContacts: db.prepare(`SELECT COUNT(*) as count FROM contacts`),
+  contactsByGroup: db.prepare(`
+    SELECT c.*, GROUP_CONCAT(ct.tag) as tags
+    FROM contacts c
+    LEFT JOIN contact_tags ct ON c.jid = ct.jid
+    INNER JOIN contact_groups cg ON c.jid = cg.jid
+    WHERE cg.group_id = ?
+    GROUP BY c.jid
+    ORDER BY c.last_seen DESC
+  `),
+  allContacts: db.prepare(`
+    SELECT c.*, GROUP_CONCAT(DISTINCT ct.tag) as tags
+    FROM contacts c
+    LEFT JOIN contact_tags ct ON c.jid = ct.jid
+    GROUP BY c.jid
+    ORDER BY c.last_seen DESC
+    LIMIT ? OFFSET ?
+  `),
+  searchContacts: db.prepare(`
+    SELECT c.*, GROUP_CONCAT(DISTINCT ct.tag) as tags
+    FROM contacts c
+    LEFT JOIN contact_tags ct ON c.jid = ct.jid
+    WHERE c.name LIKE @q OR c.phone LIKE @q
+    GROUP BY c.jid
+    ORDER BY c.last_seen DESC
+    LIMIT 100
+  `),
+  topGroups: db.prepare(`
+    SELECT group_id, group_name, COUNT(*) as contact_count, SUM(message_count) as total_messages
+    FROM contact_groups
+    GROUP BY group_id
+    ORDER BY contact_count DESC
+    LIMIT 20
+  `),
+  recentContacts: db.prepare(`
+    SELECT c.*, GROUP_CONCAT(DISTINCT ct.tag) as tags
+    FROM contacts c
+    LEFT JOIN contact_tags ct ON c.jid = ct.jid
+    GROUP BY c.jid
+    ORDER BY c.last_seen DESC
+    LIMIT 20
+  `),
+  contactStats: db.prepare(`
+    SELECT
+      COUNT(*) as total,
+      COUNT(CASE WHEN last_seen >= date('now') THEN 1 END) as today,
+      COUNT(CASE WHEN last_seen >= date('now', '-7 days') THEN 1 END) as week
+    FROM contacts
+  `),
+};
+
+// ── Contact Scraper ─────────────────────────────────────────────────────────
+function scrapeContact(senderJid, senderName, groupId, groupName, matchedKeywords) {
+  const phone = senderJid.split('@')[0].split(':')[0];
+  const now = new Date().toISOString();
+
+  const txn = db.transaction(() => {
+    stmts.upsertContact.run({ jid: senderJid, phone, name: senderName || '', now });
+    stmts.upsertContactGroup.run({ jid: senderJid, groupId, groupName, now });
+
+    // Auto-tag with group name
+    stmts.addTag.run({ jid: senderJid, tag: 'group:' + groupName });
+
+    // Add interest tags from matched keywords
+    if (matchedKeywords && matchedKeywords.length > 0) {
+      stmts.addTag.run({ jid: senderJid, tag: 'lead' });
+      const existing = stmts.getContact.get(senderJid);
+      if (existing) {
+        const interests = JSON.parse(existing.interests || '[]');
+        for (const kw of matchedKeywords) {
+          if (!interests.includes(kw)) interests.push(kw);
+        }
+        stmts.updateInterests.run({ jid: senderJid, interests: JSON.stringify(interests) });
+      }
+    }
+  });
+  txn();
+}
 
 // ── Multi-Account WhatsApp (Baileys) ────────────────────────────────────────
 const accounts = new Map();
@@ -32,7 +178,7 @@ let keywords = {
 let scannerEnabled = true;
 
 function scanMessage(text, groupId, groupName, senderJid, senderName, accountId) {
-  if (!scannerEnabled || !text) return;
+  if (!scannerEnabled || !text) return null;
   const lower = text.toLowerCase();
   const matched = [];
 
@@ -43,7 +189,7 @@ function scanMessage(text, groupId, groupName, senderJid, senderName, accountId)
     if (text.includes(kw)) matched.push(kw);
   }
 
-  if (matched.length === 0) return;
+  if (matched.length === 0) return null;
 
   const lead = {
     id: 'lead-' + (++leadIdCounter),
@@ -61,6 +207,7 @@ function scanMessage(text, groupId, groupName, senderJid, senderName, accountId)
   leads.unshift(lead);
   if (leads.length > MAX_LEADS) leads.length = MAX_LEADS;
   console.log(`[LEAD] "${matched.join(', ')}" from ${lead.senderName} in ${lead.groupName}`);
+  return matched;
 }
 
 // ── Init Account ────────────────────────────────────────────────────────────
@@ -104,7 +251,16 @@ async function initAccount(id) {
       const group = acc.groups.find(g => g.id === chatId);
       const groupName = group ? group.name : chatId;
 
-      scanMessage(text, chatId, groupName, senderJid, senderName, id);
+      // Scrape contact into DB (always, regardless of keyword match)
+      try { scrapeContact(senderJid, senderName, chatId, groupName, null); } catch (e) { console.error('Scrape error:', e.message); }
+
+      // Scan for leads
+      const matched = scanMessage(text, chatId, groupName, senderJid, senderName, id);
+
+      // Update contact with matched keywords if lead detected
+      if (matched && matched.length > 0) {
+        try { scrapeContact(senderJid, senderName, chatId, groupName, matched); } catch (e) {}
+      }
     }
   });
 
@@ -336,6 +492,121 @@ function handleExportLeads() {
   return header + '\n' + rows.join('\n');
 }
 
+// ── Contact Handlers ────────────────────────────────────────────────────────
+function handleGetContacts(query, groupId, tag, limit, offset) {
+  limit = Math.min(parseInt(limit) || 50, 200);
+  offset = parseInt(offset) || 0;
+
+  if (query) {
+    const q = '%' + query + '%';
+    return { contacts: enrichContacts(stmts.searchContacts.all({ q })) };
+  }
+  if (groupId) {
+    return { contacts: enrichContacts(stmts.contactsByGroup.all(groupId)) };
+  }
+  if (tag) {
+    const rows = db.prepare(`
+      SELECT c.*, GROUP_CONCAT(DISTINCT ct2.tag) as tags
+      FROM contacts c
+      INNER JOIN contact_tags ct ON c.jid = ct.jid AND ct.tag = ?
+      LEFT JOIN contact_tags ct2 ON c.jid = ct2.jid
+      GROUP BY c.jid ORDER BY c.last_seen DESC LIMIT ?
+    `).all(tag, limit);
+    return { contacts: enrichContacts(rows) };
+  }
+  return { contacts: enrichContacts(stmts.allContacts.all(limit, offset)) };
+}
+
+function enrichContacts(rows) {
+  return rows.map(c => {
+    const groups = stmts.getContactGroups.all(c.jid);
+    const tags = c.tags ? c.tags.split(',') : stmts.getContactTags.all(c.jid).map(r => r.tag);
+    const interests = JSON.parse(c.interests || '[]');
+
+    // Activity score: based on message count and recency
+    const daysSinceLast = (Date.now() - new Date(c.last_seen).getTime()) / 86400000;
+    const recencyScore = Math.max(0, 100 - daysSinceLast * 5);
+    const volumeScore = Math.min(100, c.message_count * 2);
+    const activityScore = Math.round((recencyScore + volumeScore) / 2);
+
+    let activityLevel = 'cold';
+    if (activityScore > 70) activityLevel = 'hot';
+    else if (activityScore > 40) activityLevel = 'warm';
+
+    return {
+      jid: c.jid,
+      phone: c.phone,
+      name: c.name,
+      firstSeen: c.first_seen,
+      lastSeen: c.last_seen,
+      messageCount: c.message_count,
+      groups,
+      tags,
+      interests,
+      notes: c.notes || '',
+      activityScore,
+      activityLevel,
+    };
+  });
+}
+
+function handleGetContactDetail(jid) {
+  const c = stmts.getContact.get(jid);
+  if (!c) return { error: 'Not found' };
+  return { contact: enrichContacts([c])[0] };
+}
+
+function handleContactStats() {
+  const stats = stmts.contactStats.get();
+  const topGroups = stmts.topGroups.all();
+  const tagCounts = db.prepare(`SELECT tag, COUNT(*) as count FROM contact_tags GROUP BY tag ORDER BY count DESC LIMIT 20`).all();
+  return { ...stats, topGroups, topTags: tagCounts };
+}
+
+function handleAddContactTag(body) {
+  const { jid, tag } = body;
+  if (!jid || !tag) return { error: 'Missing jid or tag' };
+  stmts.addTag.run({ jid, tag });
+  return { ok: true };
+}
+
+function handleRemoveContactTag(body) {
+  const { jid, tag } = body;
+  if (!jid || !tag) return { error: 'Missing jid or tag' };
+  stmts.removeTag.run({ jid, tag });
+  return { ok: true };
+}
+
+function handleUpdateContactNotes(body) {
+  const { jid, notes } = body;
+  if (!jid) return { error: 'Missing jid' };
+  stmts.updateNotes.run({ jid, notes: notes || '' });
+  return { ok: true };
+}
+
+function handleDeleteContact(jid) {
+  stmts.deleteContact.run(jid);
+  return { ok: true };
+}
+
+function handleExportContacts(groupId) {
+  let rows;
+  if (groupId) {
+    rows = stmts.contactsByGroup.all(groupId);
+  } else {
+    rows = stmts.allContacts.all(10000, 0);
+  }
+  const enriched = enrichContacts(rows);
+  const header = 'Phone,Name,Groups,Tags,Interests,Messages,First Seen,Last Seen,Activity';
+  const csvRows = enriched.map(c => {
+    const groups = c.groups.map(g => g.group_name).join('; ');
+    const tags = c.tags.filter(t => !t.startsWith('group:')).join('; ');
+    const interests = c.interests.join('; ');
+    return `"${c.phone}","${(c.name || '').replace(/"/g, '""')}","${groups}","${tags}","${interests}",${c.messageCount},"${c.firstSeen}","${c.lastSeen}","${c.activityLevel}"`;
+  });
+  return header + '\n' + csvRows.join('\n');
+}
+
 // ── HTML UI v3 ──────────────────────────────────────────────────────────────
 const HTML = `<!DOCTYPE html>
 <html lang="en" dir="ltr">
@@ -495,6 +766,24 @@ const HTML = `<!DOCTYPE html>
     .reply-modal .modal-actions { display: flex; gap: 8px; justify-content: center; }
     .reply-send { background: #00a884; color: #fff; border: none; border-radius: 20px; padding: 8px 20px; cursor: pointer; font-size: 14px; font-weight: 500; }
     .reply-send:hover { background: #06cf9c; }
+
+    /* Contact cards */
+    .contact-card { display: flex; align-items: center; gap: 10px; background: #1f2c34; border-radius: 8px; padding: 10px 12px; margin-bottom: 6px; cursor: pointer; transition: background 0.1s; }
+    .contact-card:hover { background: #253540; }
+    .contact-avatar { width: 42px; height: 42px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; font-weight: 700; color: #fff; }
+    .contact-avatar.hot { background: #dc2626; }
+    .contact-avatar.warm { background: #f59e0b; }
+    .contact-avatar.cold { background: #2a3942; color: #8696a0; }
+    .contact-info { flex: 1; min-width: 0; }
+    .contact-name { font-size: 15px; color: #e9edef; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .contact-meta { font-size: 11px; color: #8696a0; margin-top: 2px; display: flex; gap: 8px; flex-wrap: wrap; }
+    .contact-tags-mini { display: flex; gap: 3px; flex-wrap: wrap; margin-top: 3px; }
+    .contact-tag-mini { font-size: 9px; background: #2a3942; color: #8696a0; padding: 1px 5px; border-radius: 3px; }
+    .contact-tag-mini.lead { background: #f0b42920; color: #f0b429; }
+    .contact-score { font-size: 11px; font-weight: 700; flex-shrink: 0; padding: 3px 8px; border-radius: 10px; }
+    .contact-score.hot { background: #dc262620; color: #dc2626; }
+    .contact-score.warm { background: #f59e0b20; color: #f59e0b; }
+    .contact-score.cold { background: #2a3942; color: #8696a0; }
   </style>
 </head>
 <body>
@@ -518,6 +807,7 @@ const HTML = `<!DOCTYPE html>
       <button class="tab-btn active" onclick="switchTab('broadcast')" id="tabBroadcast">&#x1F4E2; Broadcast</button>
       <button class="tab-btn" onclick="switchTab('leads')" id="tabLeads">&#x1F50D; Leads <span class="badge" id="leadBadge" style="display:none">0</span></button>
       <button class="tab-btn" onclick="switchTab('keywords')" id="tabKeywords">&#x2699; Keywords</button>
+      <button class="tab-btn" onclick="switchTab('contacts')" id="tabContacts">&#x1F464; Contacts <span class="badge" id="contactBadge" style="display:none">0</span></button>
     </div>
 
     <!-- QR Modal -->
@@ -627,6 +917,95 @@ const HTML = `<!DOCTYPE html>
         <div class="bubble" style="margin-top:8px">
           <div class="bubble-label">Top Keywords</div>
           <div id="topKeywords" class="empty">No data yet</div>
+        </div>
+      </div>
+    </div>
+
+      <!-- ═══ CONTACTS TAB ═══ -->
+      <div class="tab-content" id="panelContacts">
+        <div class="stats-row" id="contactStats">
+          <div class="stat-card"><div class="stat-num" id="cStatTotal">0</div><div class="stat-label">Total</div></div>
+          <div class="stat-card"><div class="stat-num" id="cStatToday">0</div><div class="stat-label">Today</div></div>
+          <div class="stat-card"><div class="stat-num" id="cStatWeek">0</div><div class="stat-label">This Week</div></div>
+        </div>
+
+        <div class="bubble" style="padding:10px 12px">
+          <div style="display:flex;gap:6px">
+            <input type="text" id="contactSearch" placeholder="Search by name or phone..." oninput="searchContacts()" style="flex:1;border-radius:20px;padding:8px 14px;font-size:13px" />
+            <select id="contactGroupFilter" onchange="filterByGroup()" style="background:#2a3942;border:none;color:#e9edef;border-radius:20px;padding:8px 10px;font-size:12px;max-width:140px">
+              <option value="">All groups</option>
+            </select>
+          </div>
+        </div>
+
+        <div style="display:flex;justify-content:space-between;align-items:center;margin:8px 0">
+          <div class="bubble-label" style="margin:0" id="contactsCount">Contacts (0)</div>
+          <div style="display:flex;gap:6px">
+            <button class="wa-icon-btn" onclick="exportContacts()">&#x1F4E5; CSV</button>
+            <button class="wa-icon-btn" onclick="loadContacts()">&#x21BB;</button>
+          </div>
+        </div>
+
+        <div id="contactsList"></div>
+      </div>
+    </div>
+
+    <!-- Contact Detail Modal -->
+    <div class="modal-overlay" id="contactModal" style="display:none">
+      <div class="modal" style="max-width:400px;text-align:left">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+          <h3 id="cmName" style="font-size:17px"></h3>
+          <button class="modal-close" onclick="closeContactModal()" style="padding:4px 12px">&#x2715;</button>
+        </div>
+        <div style="font-size:13px;color:#8696a0;margin-bottom:12px">
+          <div>&#x1F4F1; <span id="cmPhone"></span></div>
+          <div>&#x1F4C5; First seen: <span id="cmFirstSeen"></span></div>
+          <div>&#x1F552; Last active: <span id="cmLastSeen"></span></div>
+          <div>&#x1F4AC; Messages: <span id="cmMsgCount"></span></div>
+          <div>&#x1F525; Activity: <span id="cmActivity"></span></div>
+        </div>
+
+        <div style="margin-bottom:12px">
+          <div class="kw-section-title">Groups</div>
+          <div id="cmGroups" style="font-size:12px;color:#8696a0"></div>
+        </div>
+
+        <div style="margin-bottom:12px">
+          <div class="kw-section-title">Tags</div>
+          <div id="cmTags" class="kw-tags" style="margin-bottom:6px"></div>
+          <div class="kw-add-row">
+            <input type="text" id="cmTagInput" placeholder="Add tag..." style="font-size:12px;border-radius:20px;padding:6px 10px" onkeydown="if(event.key==='Enter')addContactTag()" />
+            <button class="kw-add-btn" onclick="addContactTag()" style="font-size:12px;padding:6px 10px">+ Tag</button>
+          </div>
+        </div>
+
+        <div style="margin-bottom:12px">
+          <div class="kw-section-title">Interests</div>
+          <div id="cmInterests" class="kw-tags"></div>
+        </div>
+
+        <div style="margin-bottom:12px">
+          <div class="kw-section-title">Notes</div>
+          <textarea id="cmNotes" rows="2" style="min-height:40px;font-size:13px" placeholder="Add notes about this contact..."></textarea>
+          <button class="wa-icon-btn" onclick="saveContactNotes()" style="margin-top:4px;font-size:11px">Save notes</button>
+        </div>
+
+        <div style="display:flex;gap:6px;justify-content:flex-end;margin-top:12px;border-top:1px solid #222e35;padding-top:12px">
+          <button class="lead-btn reply" onclick="dmContact()">&#x1F4AC; Send DM</button>
+          <button class="lead-btn dismiss" onclick="deleteContact()" style="color:#f15c6d">Delete</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- DM Modal -->
+    <div class="modal-overlay" id="dmModal" style="display:none">
+      <div class="modal reply-modal">
+        <h3>Send DM</h3>
+        <div class="reply-to" id="dmTo"></div>
+        <textarea id="dmMsg" rows="3" placeholder="Type your message..."></textarea>
+        <div class="modal-actions">
+          <button class="modal-close" onclick="closeDM()">Cancel</button>
+          <button class="reply-send" onclick="sendDM()">Send</button>
         </div>
       </div>
     </div>
@@ -745,6 +1124,7 @@ const HTML = `<!DOCTYPE html>
       document.getElementById('bottomBar').style.display = tab === 'broadcast' ? 'flex' : 'none';
       if (tab === 'leads') { loadLeads(); loadLeadStats(); }
       if (tab === 'keywords') { loadKeywords(); }
+      if (tab === 'contacts') { loadContacts(); }
     }
 
     // ── Accounts ──
@@ -1038,6 +1418,203 @@ const HTML = `<!DOCTYPE html>
     loadGroups();
     setInterval(refreshAccounts, 15000);
     setInterval(pollLeads, 5000);
+
+    // ── Contacts ──
+    let contactsData = [];
+    let activeContactJid = null;
+    let contactGroupsList = [];
+
+    async function loadContacts() {
+      try {
+        var r = await fetch('/api/contacts?limit=100');
+        var d = await r.json();
+        contactsData = d.contacts || [];
+        renderContacts(contactsData);
+        loadContactStats();
+        loadContactGroups();
+      } catch (e) { console.error('Load contacts error:', e); }
+    }
+
+    async function loadContactStats() {
+      try {
+        var r = await fetch('/api/contacts/stats');
+        var d = await r.json();
+        document.getElementById('cStatTotal').textContent = d.total || 0;
+        document.getElementById('cStatToday').textContent = d.today || 0;
+        document.getElementById('cStatWeek').textContent = d.week || 0;
+        var badge = document.getElementById('contactBadge');
+        if (d.total > 0) { badge.style.display = 'inline-block'; badge.textContent = d.total > 999 ? '999+' : d.total; }
+      } catch (e) {}
+    }
+
+    async function loadContactGroups() {
+      try {
+        var r = await fetch('/api/contacts/stats');
+        var d = await r.json();
+        contactGroupsList = d.topGroups || [];
+        var sel = document.getElementById('contactGroupFilter');
+        var current = sel.value;
+        sel.innerHTML = '<option value="">All groups</option>' + contactGroupsList.map(function(g) {
+          return '<option value="' + g.group_id + '">' + esc(g.group_name) + ' (' + g.contact_count + ')</option>';
+        }).join('');
+        sel.value = current;
+      } catch (e) {}
+    }
+
+    function renderContacts(list) {
+      var el = document.getElementById('contactsList');
+      document.getElementById('contactsCount').textContent = 'Contacts (' + list.length + ')';
+      if (!list.length) { el.innerHTML = '<div class="empty">&#x1F464; No contacts scraped yet. They\\'ll appear as people chat in your groups.</div>'; return; }
+      el.innerHTML = list.map(function(c) {
+        var initial = (c.name || c.phone || '?').charAt(0).toUpperCase();
+        var tags = (c.tags || []).filter(function(t) { return !t.startsWith('group:'); }).slice(0, 3);
+        var groupCount = (c.groups || []).length;
+        return '<div class="contact-card" onclick="openContact(\\'' + c.jid.replace(/'/g, "\\\\'") + '\\')">'
+          + '<div class="contact-avatar ' + c.activityLevel + '">' + initial + '</div>'
+          + '<div class="contact-info">'
+          + '<div class="contact-name">' + esc(c.name || c.phone) + '</div>'
+          + '<div class="contact-meta"><span>&#x1F4F1; ' + esc(c.phone) + '</span><span>&#x1F4AC; ' + c.messageCount + '</span><span>&#x1F465; ' + groupCount + ' groups</span></div>'
+          + (tags.length ? '<div class="contact-tags-mini">' + tags.map(function(t) { return '<span class="contact-tag-mini' + (t === 'lead' ? ' lead' : '') + '">' + esc(t) + '</span>'; }).join('') + '</div>' : '')
+          + '</div>'
+          + '<span class="contact-score ' + c.activityLevel + '">' + c.activityScore + '</span>'
+          + '</div>';
+      }).join('');
+    }
+
+    var searchTimeout = null;
+    function searchContacts() {
+      clearTimeout(searchTimeout);
+      searchTimeout = setTimeout(async function() {
+        var q = document.getElementById('contactSearch').value.trim();
+        if (!q) { renderContacts(contactsData); return; }
+        try {
+          var r = await fetch('/api/contacts?q=' + encodeURIComponent(q));
+          var d = await r.json();
+          renderContacts(d.contacts || []);
+        } catch (e) {}
+      }, 300);
+    }
+
+    async function filterByGroup() {
+      var groupId = document.getElementById('contactGroupFilter').value;
+      if (!groupId) { renderContacts(contactsData); return; }
+      try {
+        var r = await fetch('/api/contacts?group=' + encodeURIComponent(groupId));
+        var d = await r.json();
+        renderContacts(d.contacts || []);
+      } catch (e) {}
+    }
+
+    async function openContact(jid) {
+      activeContactJid = jid;
+      try {
+        var r = await fetch('/api/contacts/detail?jid=' + encodeURIComponent(jid));
+        var d = await r.json();
+        if (d.error) return;
+        var c = d.contact;
+        document.getElementById('cmName').textContent = c.name || c.phone;
+        document.getElementById('cmPhone').textContent = c.phone;
+        document.getElementById('cmFirstSeen').textContent = new Date(c.firstSeen).toLocaleDateString();
+        document.getElementById('cmLastSeen').textContent = timeAgo(c.lastSeen);
+        document.getElementById('cmMsgCount').textContent = c.messageCount;
+        var actColors = { hot: '#dc2626', warm: '#f59e0b', cold: '#8696a0' };
+        document.getElementById('cmActivity').innerHTML = '<span style="color:' + (actColors[c.activityLevel] || '#8696a0') + ';font-weight:700">' + c.activityScore + '/100 (' + c.activityLevel + ')</span>';
+
+        document.getElementById('cmGroups').innerHTML = (c.groups || []).map(function(g) {
+          return '<div style="padding:3px 0">&#x1F4AC; ' + esc(g.group_name) + ' <span style="color:#64748b">(' + g.message_count + ' msgs)</span></div>';
+        }).join('') || '<span style="color:#64748b">None</span>';
+
+        var userTags = (c.tags || []).filter(function(t) { return !t.startsWith('group:'); });
+        document.getElementById('cmTags').innerHTML = userTags.map(function(t) {
+          return '<span class="kw-tag">' + esc(t) + '<button class="kw-x" onclick="removeContactTag(\\'' + esc(t).replace(/'/g, "\\\\'") + '\\')">&times;</button></span>';
+        }).join('') || '<span style="color:#64748b;font-size:12px">No tags</span>';
+
+        document.getElementById('cmInterests').innerHTML = (c.interests || []).map(function(i) {
+          return '<span class="lead-kw-tag">' + esc(i) + '</span>';
+        }).join('') || '<span style="color:#64748b;font-size:12px">No interests detected</span>';
+
+        document.getElementById('cmNotes').value = c.notes || '';
+        document.getElementById('contactModal').style.display = 'flex';
+      } catch (e) { console.error('Open contact error:', e); }
+    }
+
+    function closeContactModal() { document.getElementById('contactModal').style.display = 'none'; activeContactJid = null; }
+
+    async function addContactTag() {
+      var input = document.getElementById('cmTagInput');
+      var tag = input.value.trim();
+      if (!tag || !activeContactJid) return;
+      try {
+        await fetch('/api/contacts/tag', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jid: activeContactJid, tag: tag }) });
+        input.value = '';
+        openContact(activeContactJid);
+      } catch (e) {}
+    }
+
+    async function removeContactTag(tag) {
+      if (!activeContactJid) return;
+      try {
+        await fetch('/api/contacts/tag', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jid: activeContactJid, tag: tag }) });
+        openContact(activeContactJid);
+      } catch (e) {}
+    }
+
+    async function saveContactNotes() {
+      if (!activeContactJid) return;
+      var notes = document.getElementById('cmNotes').value;
+      try {
+        await fetch('/api/contacts/notes', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jid: activeContactJid, notes: notes }) });
+        alert('Notes saved!');
+      } catch (e) {}
+    }
+
+    async function deleteContact() {
+      if (!activeContactJid || !confirm('Delete this contact?')) return;
+      try {
+        await fetch('/api/contacts/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jid: activeContactJid }) });
+        closeContactModal();
+        loadContacts();
+      } catch (e) {}
+    }
+
+    function dmContact() {
+      if (!activeContactJid) return;
+      var c = contactsData.find(function(x) { return x.jid === activeContactJid; });
+      document.getElementById('dmTo').textContent = 'To: ' + (c ? (c.name || c.phone) : activeContactJid);
+      document.getElementById('dmMsg').value = '';
+      document.getElementById('dmModal').style.display = 'flex';
+      document.getElementById('dmMsg').focus();
+    }
+
+    function closeDM() { document.getElementById('dmModal').style.display = 'none'; }
+
+    async function sendDM() {
+      var msg = document.getElementById('dmMsg').value.trim();
+      if (!msg || !activeContactJid) return;
+      // Find a connected socket
+      try {
+        var phone = activeContactJid.split('@')[0];
+        var dmJid = phone + '@s.whatsapp.net';
+        // Use the lead reply endpoint with a fake lead
+        var r = await fetch('/api/broadcast', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chatIds: [dmJid], message: msg }) });
+        var d = await r.json();
+        if (d.sent > 0) { closeDM(); alert('DM sent!'); }
+        else { alert('Failed to send: ' + (d.error || 'No connected account')); }
+      } catch (e) { alert('Error: ' + e.message); }
+    }
+
+    async function exportContacts() {
+      try {
+        var groupId = document.getElementById('contactGroupFilter').value;
+        var url = '/api/contacts/export' + (groupId ? '?group=' + encodeURIComponent(groupId) : '');
+        var r = await fetch(url);
+        var text = await r.text();
+        var blob = new Blob([text], { type: 'text/csv' });
+        var a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+        a.download = 'contacts-' + new Date().toISOString().slice(0, 10) + '.csv';
+        a.click(); URL.revokeObjectURL(a.href);
+      } catch (e) { alert('Export error: ' + e.message); }
+    }
   </script>
 </body>
 </html>`;
@@ -1127,11 +1704,45 @@ const server = http.createServer(async (req, res) => {
     catch (e) { json(res, { error: e.message }, 500); } return;
   }
 
+  // Contact routes
+  if (p === '/api/contacts' && req.method === 'GET') {
+    json(res, handleGetContacts(params.get('q'), params.get('group'), params.get('tag'), params.get('limit'), params.get('offset'))); return;
+  }
+  if (p === '/api/contacts/stats') { json(res, handleContactStats()); return; }
+  if (p === '/api/contacts/detail' && req.method === 'GET') {
+    const jid = params.get('jid');
+    if (!jid) { json(res, { error: 'Missing jid' }, 400); return; }
+    json(res, handleGetContactDetail(jid)); return;
+  }
+  if (p === '/api/contacts/tag' && req.method === 'POST') {
+    try { const body = await readBody(req); json(res, handleAddContactTag(JSON.parse(body))); }
+    catch (e) { json(res, { error: e.message }, 500); } return;
+  }
+  if (p === '/api/contacts/tag' && req.method === 'DELETE') {
+    try { const body = await readBody(req); json(res, handleRemoveContactTag(JSON.parse(body))); }
+    catch (e) { json(res, { error: e.message }, 500); } return;
+  }
+  if (p === '/api/contacts/notes' && req.method === 'PUT') {
+    try { const body = await readBody(req); json(res, handleUpdateContactNotes(JSON.parse(body))); }
+    catch (e) { json(res, { error: e.message }, 500); } return;
+  }
+  if (p === '/api/contacts/delete' && req.method === 'POST') {
+    try { const body = await readBody(req); json(res, handleDeleteContact(JSON.parse(body).jid)); }
+    catch (e) { json(res, { error: e.message }, 500); } return;
+  }
+  if (p === '/api/contacts/export') {
+    const csv = handleExportContacts(params.get('group'));
+    res.writeHead(200, { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="contacts.csv"' });
+    res.end(csv); return;
+  }
+
   res.writeHead(404); res.end('Not found');
 });
 
 server.listen(PORT, '0.0.0.0', () => {
+  const contactCount = stmts.totalContacts.get().count;
   console.log('WhatsApp Broadcast Pro v3 running on port ' + PORT);
   console.log('Accounts loaded: ' + accounts.size);
+  console.log('Contacts in DB: ' + contactCount);
   console.log('Scanner: ' + (scannerEnabled ? 'ON' : 'OFF') + ' | Keywords: ' + keywords.en.length + ' EN, ' + keywords.he.length + ' HE');
 });
