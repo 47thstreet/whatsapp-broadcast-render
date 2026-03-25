@@ -795,12 +795,14 @@ const HTML = `<!DOCTYPE html>
     .add-chip { background: #005c4b; font-weight: 500; }
     .add-chip:hover { background: #06cf9c; }
 
-    /* Tabs */
-    .tab-bar { display: flex; background: #111b21; border-bottom: 1px solid #222e35; }
-    .tab-btn { flex: 1; padding: 12px 8px; background: none; border: none; color: #8696a0; font-size: 13px; font-weight: 600; cursor: pointer; text-transform: uppercase; letter-spacing: 0.05em; position: relative; transition: color 0.15s; }
+    /* Bottom Nav */
+    .tab-bar { display: flex; background: #1f2c34; border-top: 1px solid #222e35; position: fixed; bottom: 0; left: 0; right: 0; z-index: 50; max-width: 500px; margin: 0 auto; }
+    .tab-btn { flex: 1; padding: 6px 4px 8px; background: none; border: none; color: #8696a0; font-size: 10px; font-weight: 600; cursor: pointer; text-transform: uppercase; letter-spacing: 0.03em; position: relative; transition: color 0.15s; display: flex; flex-direction: column; align-items: center; gap: 2px; }
+    .tab-btn .tab-icon { font-size: 20px; line-height: 1; }
     .tab-btn.active { color: #00a884; }
-    .tab-btn.active::after { content: ''; position: absolute; bottom: 0; left: 16px; right: 16px; height: 3px; background: #00a884; border-radius: 3px 3px 0 0; }
-    .tab-btn .badge { display: inline-block; background: #f15c6d; color: #fff; font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 8px; margin-left: 4px; min-width: 16px; text-align: center; }
+    .tab-btn.active::after { content: ''; position: absolute; top: 0; left: 16px; right: 16px; height: 3px; background: #00a884; border-radius: 0 0 3px 3px; }
+    .tab-btn .badge { position: absolute; top: 2px; right: calc(50% - 20px); background: #f15c6d; color: #fff; font-size: 9px; font-weight: 700; padding: 1px 4px; border-radius: 8px; min-width: 14px; text-align: center; }
+    .app { padding-bottom: 64px; }
 
     .tab-content { display: none; }
     .tab-content.active { display: block; }
@@ -837,7 +839,7 @@ const HTML = `<!DOCTYPE html>
     .wa-icon-btn { background: #2a3942; border: none; color: #8696a0; font-size: 12px; padding: 6px 10px; border-radius: 20px; cursor: pointer; transition: all 0.15s; }
     .wa-icon-btn:hover { background: #374045; color: #e9edef; }
 
-    .bottom-bar { background: #1f2c34; padding: 8px 12px; display: flex; align-items: center; gap: 8px; position: sticky; bottom: 0; }
+    .bottom-bar { background: #1f2c34; padding: 8px 12px; display: flex; align-items: center; gap: 8px; border-radius: 8px; margin-top: 8px; }
     .send-btn { width: 48px; height: 48px; background: #00a884; border: none; border-radius: 50%; color: #fff; font-size: 20px; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background 0.15s; flex-shrink: 0; }
     .send-btn:hover { background: #06cf9c; }
     .send-btn:disabled { background: #2a3942; color: #8696a0; cursor: not-allowed; }
@@ -955,6 +957,13 @@ const HTML = `<!DOCTYPE html>
     .add-member-item { display: flex; align-items: center; gap: 8px; padding: 8px; border-bottom: 1px solid #222e35; cursor: pointer; }
     .add-member-item:hover { background: #222e35; }
     .add-member-item input[type=checkbox] { accent-color: #00a884; width: 16px; height: 16px; }
+
+    /* Swipe to delete */
+    .swipe-wrap { position: relative; overflow: hidden; border-radius: 8px; margin-bottom: 2px; }
+    .swipe-inner { position: relative; transition: transform 0.25s ease; touch-action: pan-y; }
+    .swipe-inner.swiping { transition: none; }
+    .swipe-delete { position: absolute; right: 0; top: 0; bottom: 0; width: 80px; background: #dc2626; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 13px; font-weight: 600; cursor: pointer; }
+    .swipe-delete:hover { background: #ef4444; }
   </style>
 </head>
 <body>
@@ -974,13 +983,7 @@ const HTML = `<!DOCTYPE html>
       <button class="acc-chip add-chip" onclick="addAccount()" id="addBtn">+ Add</button>
     </div>
 
-    <div class="tab-bar">
-      <button class="tab-btn active" onclick="switchTab('broadcast')" id="tabBroadcast">&#x1F4E2; Broadcast</button>
-      <button class="tab-btn" onclick="switchTab('leads')" id="tabLeads">&#x1F50D; Leads <span class="badge" id="leadBadge" style="display:none">0</span></button>
-      <button class="tab-btn" onclick="switchTab('keywords')" id="tabKeywords">&#x2699; Keywords</button>
-      <button class="tab-btn" onclick="switchTab('contacts')" id="tabContacts">&#x1F464; Contacts <span class="badge" id="contactBadge" style="display:none">0</span></button>
-      <button class="tab-btn" onclick="switchTab('lists')" id="tabLists">&#x1F4CB; Lists</button>
-    </div>
+    <!-- tab bar moved to bottom -->
 
     <!-- QR Modal -->
     <div class="modal-overlay" id="qrModal" style="display:none">
@@ -1253,6 +1256,15 @@ const HTML = `<!DOCTYPE html>
       <div class="send-info" id="sendLabel">Select groups & write a message</div>
       <button class="send-btn" id="sendBtn" onclick="send()" disabled>&#x27A4;</button>
     </div>
+
+    <!-- Bottom Nav -->
+    <div class="tab-bar" id="mainTabBar">
+      <button class="tab-btn active" onclick="switchTab('broadcast')" id="tabBroadcast"><span class="tab-icon">&#x1F4E2;</span>Send</button>
+      <button class="tab-btn" onclick="switchTab('leads')" id="tabLeads"><span class="tab-icon">&#x1F525;</span>Leads<span class="badge" id="leadBadge" style="display:none">0</span></button>
+      <button class="tab-btn" onclick="switchTab('contacts')" id="tabContacts"><span class="tab-icon">&#x1F464;</span>People<span class="badge" id="contactBadge" style="display:none">0</span></button>
+      <button class="tab-btn" onclick="switchTab('lists')" id="tabLists"><span class="tab-icon">&#x1F4CB;</span>Lists</button>
+      <button class="tab-btn" onclick="switchTab('keywords')" id="tabKeywords"><span class="tab-icon">&#x2699;</span>Settings</button>
+    </div>
   </div>
 
   <script>
@@ -1359,7 +1371,7 @@ const HTML = `<!DOCTYPE html>
       document.querySelectorAll('.tab-content').forEach(function(p) { p.classList.remove('active'); });
       document.getElementById('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.add('active');
       document.getElementById('panel' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.add('active');
-      document.getElementById('bottomBar').style.display = tab === 'broadcast' ? 'flex' : 'none';
+      document.getElementById('bottomBar').style.display = tab === 'broadcast' ? '' : 'none';
       if (tab === 'leads') { loadLeads(); loadLeadStats(); }
       if (tab === 'keywords') { loadKeywords(); }
       if (tab === 'contacts') { loadContacts(); }
@@ -1414,21 +1426,44 @@ const HTML = `<!DOCTYPE html>
       catch (e) { document.getElementById('groupsList').innerHTML = '<div class="empty">' + t('groupsError') + '</div>'; }
     }
 
+    var hiddenGroups = new Set(JSON.parse(localStorage.getItem('wa-hidden-groups') || '[]'));
+
     function renderGroups() {
       var el = document.getElementById('groupsList');
       var validIds = new Set(groups.map(function(g) { return g.id; }));
       selected.forEach(function(id) { if (!validIds.has(id)) selected.delete(id); });
-      if (!groups.length) { el.innerHTML = '<div class="empty">' + t('groupsEmpty') + '</div>'; return; }
-      el.innerHTML = groups.map(function(g, i) {
+      var visible = groups.filter(function(g) { return !hiddenGroups.has(g.id); });
+      if (!visible.length) { el.innerHTML = '<div class="empty">' + t('groupsEmpty') + (hiddenGroups.size ? '<br><button class="wa-link" onclick="unhideAllGroups()" style="margin-top:8px">Show ' + hiddenGroups.size + ' hidden</button>' : '') + '</div>'; return; }
+      el.innerHTML = visible.map(function(g, i) {
         var acctTag = accountsList.length > 1 ? '<span class="group-acct">' + esc(g.accountName || '') + '</span>' : '';
-        return '<div class="group-item ' + (selected.has(g.id) ? 'selected' : '') + '" onclick="toggle(\\'' + g.id + '\\')">'
+        return '<div class="swipe-wrap"><div class="swipe-delete" onclick="hideGroup(\\'' + g.id + '\\')">Hide</div>'
+          + '<div class="swipe-inner" data-swipe="true">'
+          + '<div class="group-item ' + (selected.has(g.id) ? 'selected' : '') + '" onclick="toggle(\\'' + g.id + '\\')">'
           + '<input type="checkbox" ' + (selected.has(g.id) ? 'checked' : '') + ' onclick="event.stopPropagation();toggle(\\'' + g.id + '\\')">'
           + '<div class="group-avatar">' + ['&#x1F389;','&#x1F38A;','&#x1F973;','&#x1F3B6;','&#x1FA69;'][i % 5] + '</div>'
           + '<div class="group-info"><div class="group-name">' + esc(g.name) + '</div>'
           + '<div class="group-count">' + (g.participantCount || '?') + ' ' + t('members') + ' ' + acctTag + '</div></div>'
-          + '</div>';
+          + '</div></div></div>';
       }).join('');
+      if (hiddenGroups.size) {
+        el.innerHTML += '<div style="text-align:center;padding:8px"><button class="wa-link" onclick="unhideAllGroups()">Show ' + hiddenGroups.size + ' hidden groups</button></div>';
+      }
+      initSwipe();
       updateSendBtn();
+    }
+
+    function hideGroup(id) {
+      hiddenGroups.add(id);
+      selected.delete(id);
+      localStorage.setItem('wa-hidden-groups', JSON.stringify(Array.from(hiddenGroups)));
+      renderGroups();
+      document.getElementById('groupsLabel').innerHTML = t('groupsLabel', selected.size);
+    }
+
+    function unhideAllGroups() {
+      hiddenGroups.clear();
+      localStorage.setItem('wa-hidden-groups', '[]');
+      renderGroups();
     }
 
     function toggle(id) { if (selected.has(id)) selected.delete(id); else selected.add(id); renderGroups(); document.getElementById('groupsLabel').innerHTML = t('groupsLabel', selected.size); }
@@ -1657,6 +1692,46 @@ const HTML = `<!DOCTYPE html>
     loadGroups();
     setInterval(refreshAccounts, 15000);
     setInterval(pollLeads, 5000);
+
+    // ── Swipe to delete ──
+    function initSwipe() {
+      document.querySelectorAll('[data-swipe]').forEach(function(el) {
+        if (el._swipeInit) return;
+        el._swipeInit = true;
+        var startX = 0, currentX = 0, swiping = false;
+
+        el.addEventListener('touchstart', function(e) {
+          startX = e.touches[0].clientX;
+          currentX = 0;
+          el.classList.add('swiping');
+        }, { passive: true });
+
+        el.addEventListener('touchmove', function(e) {
+          var dx = e.touches[0].clientX - startX;
+          if (dx > 0) dx = 0; // only swipe left
+          currentX = Math.max(dx, -80);
+          el.style.transform = 'translateX(' + currentX + 'px)';
+          swiping = true;
+        }, { passive: true });
+
+        el.addEventListener('touchend', function() {
+          el.classList.remove('swiping');
+          if (currentX < -40) {
+            el.style.transform = 'translateX(-80px)';
+          } else {
+            el.style.transform = 'translateX(0)';
+          }
+          setTimeout(function() { swiping = false; }, 50);
+        });
+
+        // Reset on click elsewhere
+        el.addEventListener('click', function() {
+          if (el.style.transform === 'translateX(-80px)') {
+            el.style.transform = 'translateX(0)';
+          }
+        });
+      });
+    }
 
     // ── Contacts ──
     let contactsData = [];
@@ -1999,14 +2074,16 @@ const HTML = `<!DOCTYPE html>
         if (!members.length) { el.innerHTML = '<div class="empty">No members yet. Click "+ Add contacts" to add some.</div>'; return; }
         el.innerHTML = members.map(function(c) {
           var initial = (c.name || c.phone || '?').charAt(0).toUpperCase();
-          return '<div class="contact-card">'
+          return '<div class="swipe-wrap"><div class="swipe-delete" onclick="removeMember(\\'' + c.jid.replace(/'/g, "\\\\'") + '\\')">Remove</div>'
+            + '<div class="swipe-inner" data-swipe="true">'
+            + '<div class="contact-card" style="margin:0">'
             + '<div class="contact-avatar ' + c.activityLevel + '">' + initial + '</div>'
             + '<div class="contact-info" onclick="openContact(\\'' + c.jid.replace(/'/g, "\\\\'") + '\\')">'
             + '<div class="contact-name">' + esc(c.name || c.phone) + '</div>'
             + '<div class="contact-meta"><span>&#x1F4F1; ' + esc(c.phone) + '</span><span>&#x1F525; ' + c.activityScore + '</span></div></div>'
-            + '<button class="list-del" onclick="removeMember(\\'' + c.jid.replace(/'/g, "\\\\'") + '\\')" title="Remove">&#x2715;</button>'
-            + '</div>';
+            + '</div></div></div>';
         }).join('');
+        initSwipe();
       } catch (e) {}
     }
 
