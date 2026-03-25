@@ -12,13 +12,58 @@ const BASE_SESSION_DIR = path.resolve('./wa-session');
 const logger = pino({ level: 'silent' });
 
 // ── Multi-Account WhatsApp (Baileys) ────────────────────────────────────────
-const accounts = new Map(); // id -> { id, name, phone, sock, status, qrDataUrl, groups }
+const accounts = new Map();
 let idCounter = 0;
 
 function makeId() {
   return 'wa' + (++idCounter) + '-' + Date.now().toString(36);
 }
 
+// ── Lead Scanner ────────────────────────────────────────────────────────────
+const MAX_LEADS = 500;
+const leads = []; // { id, groupId, groupName, senderJid, senderName, message, matchedKeywords, accountId, timestamp }
+let leadIdCounter = 0;
+
+let keywords = {
+  en: ['party', 'event', 'club', 'dj', 'bottle service', 'vip', 'guestlist', 'guest list', 'tickets', 'nightlife', 'tonight', 'this weekend', 'where to go', 'going out', 'celebration', 'birthday party', 'new years', 'nye', 'rooftop', 'venue', 'afterparty', 'after party', 'rave', 'festival', 'who is coming', 'whos coming', 'any events', 'any parties', 'looking for a party', 'whats happening'],
+  he: ['\u05DE\u05E1\u05D9\u05D1\u05D4', '\u05D0\u05D9\u05E8\u05D5\u05E2', '\u05DE\u05D5\u05E2\u05D3\u05D5\u05DF', '\u05D3\u05D9\u05D2\u05F3\u05D9\u05D9', '\u05E9\u05D5\u05DC\u05D7\u05DF vip', '\u05E8\u05E9\u05D9\u05DE\u05EA \u05D0\u05D5\u05E8\u05D7\u05D9\u05DD', '\u05DB\u05E8\u05D8\u05D9\u05E1\u05D9\u05DD', '\u05D4\u05D9\u05D5\u05DD \u05D1\u05DC\u05D9\u05DC\u05D4', '\u05D4\u05DC\u05D9\u05DC\u05D4', '\u05E1\u05D5\u05E3 \u05E9\u05D1\u05D5\u05E2', '\u05DC\u05E6\u05D0\u05EA', '\u05D7\u05D2\u05D9\u05D2\u05D4', '\u05D9\u05D5\u05DD \u05D4\u05D5\u05DC\u05D3\u05EA', '\u05D2\u05D2', '\u05DE\u05E7\u05D5\u05DD', '\u05D0\u05E4\u05D8\u05E8', '\u05E8\u05D9\u05D9\u05D1', '\u05E4\u05E1\u05D8\u05D9\u05D1\u05DC', '\u05D0\u05D9\u05E4\u05D4 \u05D9\u05D5\u05E6\u05D0\u05D9\u05DD', '\u05DE\u05D9 \u05D1\u05D0', '\u05D9\u05E9 \u05DE\u05E1\u05D9\u05D1\u05D4', '\u05D9\u05E9 \u05D0\u05D9\u05E8\u05D5\u05E2', '\u05DE\u05D4 \u05E7\u05D5\u05E8\u05D4', '\u05DE\u05D4 \u05D9\u05E9 \u05D4\u05DC\u05D9\u05DC\u05D4']
+};
+
+let scannerEnabled = true;
+
+function scanMessage(text, groupId, groupName, senderJid, senderName, accountId) {
+  if (!scannerEnabled || !text) return;
+  const lower = text.toLowerCase();
+  const matched = [];
+
+  for (const kw of keywords.en) {
+    if (lower.includes(kw.toLowerCase())) matched.push(kw);
+  }
+  for (const kw of keywords.he) {
+    if (text.includes(kw)) matched.push(kw);
+  }
+
+  if (matched.length === 0) return;
+
+  const lead = {
+    id: 'lead-' + (++leadIdCounter),
+    groupId,
+    groupName: groupName || groupId,
+    senderJid,
+    senderName: senderName || senderJid.split('@')[0],
+    message: text.slice(0, 500),
+    matchedKeywords: matched,
+    accountId,
+    timestamp: new Date().toISOString(),
+    dismissed: false,
+  };
+
+  leads.unshift(lead);
+  if (leads.length > MAX_LEADS) leads.length = MAX_LEADS;
+  console.log(`[LEAD] "${matched.join(', ')}" from ${lead.senderName} in ${lead.groupName}`);
+}
+
+// ── Init Account ────────────────────────────────────────────────────────────
 async function initAccount(id) {
   const acc = accounts.get(id);
   if (!acc) return;
@@ -41,6 +86,27 @@ async function initAccount(id) {
   });
   acc.sock = sock;
   sock.ev.on('creds.update', saveCreds);
+
+  // ── Message listener for lead scanning ──
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    for (const msg of messages) {
+      if (!msg.message || msg.key.fromMe) continue;
+      const chatId = msg.key.remoteJid;
+      if (!chatId || !chatId.endsWith('@g.us')) continue; // groups only
+
+      const text = msg.message.conversation
+        || msg.message.extendedTextMessage?.text
+        || '';
+      if (!text) continue;
+
+      const senderJid = msg.key.participant || msg.key.remoteJid;
+      const senderName = msg.pushName || '';
+      const group = acc.groups.find(g => g.id === chatId);
+      const groupName = group ? group.name : chatId;
+
+      scanMessage(text, chatId, groupName, senderJid, senderName, id);
+    }
+  });
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -154,7 +220,6 @@ async function handleBroadcast(body) {
   if (!chatIds || !Array.isArray(chatIds) || !message) return { sent: 0, failed: 0, error: 'Missing chatIds or message' };
   if (chatIds.length > 200) return { sent: 0, failed: 0, error: 'Max 200 recipients per broadcast' };
 
-  // Build chatId -> socket lookup
   const lookup = new Map();
   for (const [, acc] of accounts) {
     if (acc.status === 'ready' && acc.sock) {
@@ -177,14 +242,108 @@ async function handleBroadcast(body) {
   return { sent, failed, total: chatIds.length, results };
 }
 
-// ── HTML UI — WhatsApp Native v2 + Multi-Account ────────────────────────────
+// ── Lead Handlers ───────────────────────────────────────────────────────────
+function handleGetLeads(since) {
+  const active = leads.filter(l => !l.dismissed);
+  if (since) {
+    return { leads: active.filter(l => l.timestamp > since) };
+  }
+  return { leads: active.slice(0, 100) };
+}
+
+function handleDismissLead(id) {
+  const lead = leads.find(l => l.id === id);
+  if (!lead) return { error: 'Not found' };
+  lead.dismissed = true;
+  return { ok: true };
+}
+
+function handleDismissAll() {
+  leads.forEach(l => l.dismissed = true);
+  return { ok: true };
+}
+
+async function handleReplyToLead(body) {
+  const { leadId, message } = body;
+  if (!leadId || !message) return { error: 'Missing leadId or message' };
+  const lead = leads.find(l => l.id === leadId);
+  if (!lead) return { error: 'Lead not found' };
+
+  // Find a socket that has this group
+  let sock = null;
+  for (const [, acc] of accounts) {
+    if (acc.status === 'ready' && acc.sock && acc.groups.some(g => g.id === lead.groupId)) {
+      sock = acc.sock;
+      break;
+    }
+  }
+  if (!sock) return { error: 'No connected account for this group' };
+
+  try {
+    // DM the sender
+    const dmJid = lead.senderJid.includes('@') ? lead.senderJid.replace(/@g\.us|@s\.whatsapp\.net/, '') + '@s.whatsapp.net' : lead.senderJid + '@s.whatsapp.net';
+    await sock.sendMessage(dmJid, { text: message });
+    return { ok: true, sentTo: dmJid };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+function handleLeadStats() {
+  const now = new Date();
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+  const weekStart = new Date(now - 7 * 86400000).toISOString();
+
+  const active = leads.filter(l => !l.dismissed);
+  const today = active.filter(l => l.timestamp >= todayStart);
+  const week = active.filter(l => l.timestamp >= weekStart);
+
+  // Top groups
+  const groupCounts = {};
+  active.forEach(l => { groupCounts[l.groupName] = (groupCounts[l.groupName] || 0) + 1; });
+  const topGroups = Object.entries(groupCounts).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name, count]) => ({ name, count }));
+
+  // Top keywords
+  const kwCounts = {};
+  active.forEach(l => l.matchedKeywords.forEach(kw => { kwCounts[kw] = (kwCounts[kw] || 0) + 1; }));
+  const topKeywords = Object.entries(kwCounts).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([keyword, count]) => ({ keyword, count }));
+
+  return { total: active.length, today: today.length, week: week.length, topGroups, topKeywords };
+}
+
+function handleGetKeywords() {
+  return { keywords, scannerEnabled };
+}
+
+function handleUpdateKeywords(body) {
+  if (body.keywords) {
+    if (body.keywords.en) keywords.en = body.keywords.en;
+    if (body.keywords.he) keywords.he = body.keywords.he;
+  }
+  if (typeof body.scannerEnabled === 'boolean') scannerEnabled = body.scannerEnabled;
+  return { ok: true, keywords, scannerEnabled };
+}
+
+function handleExportLeads() {
+  const active = leads.filter(l => !l.dismissed);
+  const header = 'Timestamp,Group,Sender,Phone,Message,Keywords';
+  const rows = active.map(l => {
+    const phone = l.senderJid.split('@')[0];
+    const msg = l.message.replace(/"/g, '""').replace(/\n/g, ' ');
+    const kws = l.matchedKeywords.join('; ');
+    return `"${l.timestamp}","${l.groupName}","${l.senderName}","${phone}","${msg}","${kws}"`;
+  });
+  return header + '\n' + rows.join('\n');
+}
+
+// ── HTML UI v3 ──────────────────────────────────────────────────────────────
 const HTML = `<!DOCTYPE html>
 <html lang="en" dir="ltr">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <meta name="theme-color" content="#1f2c34" />
-  <title>Broadcast Pro</title>
+  <title>Broadcast Pro v3</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: 'Segoe UI', Helvetica, Arial, sans-serif; background: #0b141a; color: #e9edef; min-height: 100vh; min-height: 100dvh; }
@@ -199,7 +358,6 @@ const HTML = `<!DOCTYPE html>
     .topbar-btn { background: none; border: none; color: #aebac1; font-size: 13px; padding: 8px; border-radius: 50%; cursor: pointer; transition: background 0.15s; }
     .topbar-btn:hover { background: #ffffff10; }
 
-    /* Account chips bar */
     .accounts-bar { display: flex; gap: 6px; padding: 8px 16px; background: #111b21; overflow-x: auto; }
     .accounts-bar::-webkit-scrollbar { display: none; }
     .acc-chip { display: flex; align-items: center; gap: 6px; padding: 6px 10px; background: #2a3942; border-radius: 20px; font-size: 12px; cursor: pointer; flex-shrink: 0; transition: all 0.15s; color: #e9edef; border: none; }
@@ -212,14 +370,25 @@ const HTML = `<!DOCTYPE html>
     .add-chip { background: #005c4b; font-weight: 500; }
     .add-chip:hover { background: #06cf9c; }
 
+    /* Tabs */
+    .tab-bar { display: flex; background: #111b21; border-bottom: 1px solid #222e35; }
+    .tab-btn { flex: 1; padding: 12px 8px; background: none; border: none; color: #8696a0; font-size: 13px; font-weight: 600; cursor: pointer; text-transform: uppercase; letter-spacing: 0.05em; position: relative; transition: color 0.15s; }
+    .tab-btn.active { color: #00a884; }
+    .tab-btn.active::after { content: ''; position: absolute; bottom: 0; left: 16px; right: 16px; height: 3px; background: #00a884; border-radius: 3px 3px 0 0; }
+    .tab-btn .badge { display: inline-block; background: #f15c6d; color: #fff; font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 8px; margin-left: 4px; min-width: 16px; text-align: center; }
+
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+
     .chat-area { flex: 1; padding: 12px 12px 8px; background: #0b141a; background-image: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.02'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E"); overflow-y: auto; }
 
     .bubble { background: #1f2c34; border-radius: 8px; padding: 14px; margin-bottom: 8px; position: relative; }
     .bubble::before { content: ''; position: absolute; top: 0; left: -6px; width: 0; height: 0; border-top: 6px solid #1f2c34; border-left: 6px solid transparent; }
     .bubble-label { font-size: 12px; font-weight: 600; color: #00a884; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.04em; }
 
-    textarea { width: 100%; background: #2a3942; border: none; border-radius: 8px; padding: 10px 12px; color: #e9edef; font-size: 15px; resize: none; min-height: 80px; font-family: inherit; outline: none; line-height: 1.4; }
-    textarea::placeholder { color: #8696a0; }
+    textarea, input[type=text] { width: 100%; background: #2a3942; border: none; border-radius: 8px; padding: 10px 12px; color: #e9edef; font-size: 15px; font-family: inherit; outline: none; }
+    textarea { resize: none; min-height: 80px; line-height: 1.4; }
+    textarea::placeholder, input::placeholder { color: #8696a0; }
     .char-count { font-size: 11px; color: #8696a0; margin-top: 4px; text-align: right; }
 
     .groups-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
@@ -266,7 +435,7 @@ const HTML = `<!DOCTYPE html>
     @keyframes spin { to { transform: rotate(360deg); } }
 
     .modal-overlay { position: fixed; inset: 0; background: #000000cc; display: flex; align-items: center; justify-content: center; z-index: 100; }
-    .modal { background: #1f2c34; border-radius: 12px; padding: 24px; max-width: 320px; width: 90%; text-align: center; }
+    .modal { background: #1f2c34; border-radius: 12px; padding: 24px; max-width: 360px; width: 90%; text-align: center; }
     .modal h3 { font-size: 17px; font-weight: 500; color: #e9edef; margin-bottom: 6px; }
     .modal p { font-size: 13px; color: #8696a0; margin-bottom: 16px; line-height: 1.4; }
     .qr-wrap { background: #fff; border-radius: 8px; padding: 12px; display: inline-block; margin-bottom: 16px; }
@@ -276,6 +445,56 @@ const HTML = `<!DOCTYPE html>
     .modal-close:hover { background: #374045; color: #e9edef; }
 
     .mod-badge { display: inline-block; background: #00a884; color: #fff; font-size: 9px; font-weight: 700; padding: 2px 5px; border-radius: 3px; letter-spacing: 0.5px; vertical-align: middle; margin-left: 6px; }
+
+    /* Lead cards */
+    .lead-card { background: #1f2c34; border-radius: 8px; padding: 12px; margin-bottom: 8px; border-left: 3px solid #f0b429; }
+    .lead-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 6px; }
+    .lead-sender { font-size: 14px; font-weight: 600; color: #e9edef; }
+    .lead-group { font-size: 11px; color: #00a884; }
+    .lead-time { font-size: 11px; color: #8696a0; flex-shrink: 0; }
+    .lead-msg { font-size: 14px; color: #d1d7db; line-height: 1.4; margin-bottom: 8px; word-break: break-word; }
+    .lead-msg .kw-match { background: #f0b42930; color: #f0b429; padding: 1px 3px; border-radius: 3px; font-weight: 600; }
+    .lead-keywords { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 8px; }
+    .lead-kw-tag { font-size: 10px; background: #f0b42920; color: #f0b429; padding: 2px 6px; border-radius: 4px; }
+    .lead-actions { display: flex; gap: 6px; }
+    .lead-btn { font-size: 11px; padding: 4px 10px; border-radius: 6px; border: none; cursor: pointer; font-weight: 500; transition: all 0.15s; }
+    .lead-btn.reply { background: #005c4b; color: #e9edef; }
+    .lead-btn.reply:hover { background: #00a884; }
+    .lead-btn.dismiss { background: #2a3942; color: #8696a0; }
+    .lead-btn.dismiss:hover { background: #374045; color: #e9edef; }
+
+    /* Stats cards */
+    .stats-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
+    .stat-card { background: #1f2c34; border-radius: 8px; padding: 12px; text-align: center; }
+    .stat-num { font-size: 24px; font-weight: 800; color: #00a884; }
+    .stat-label { font-size: 10px; color: #8696a0; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 2px; }
+
+    /* Keywords UI */
+    .kw-section { margin-bottom: 16px; }
+    .kw-section-title { font-size: 13px; font-weight: 600; color: #00a884; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .kw-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+    .kw-tag { display: flex; align-items: center; gap: 4px; background: #2a3942; color: #e9edef; padding: 4px 10px; border-radius: 16px; font-size: 13px; }
+    .kw-tag .kw-x { background: none; border: none; color: #8696a0; cursor: pointer; font-size: 12px; padding: 0 2px; line-height: 1; }
+    .kw-tag .kw-x:hover { color: #f15c6d; }
+    .kw-add-row { display: flex; gap: 6px; }
+    .kw-add-row input { flex: 1; padding: 8px 12px; font-size: 13px; border-radius: 20px; }
+    .kw-add-btn { background: #005c4b; color: #fff; border: none; border-radius: 20px; padding: 8px 14px; font-size: 13px; cursor: pointer; font-weight: 500; white-space: nowrap; }
+    .kw-add-btn:hover { background: #00a884; }
+
+    .toggle-row { display: flex; align-items: center; justify-content: space-between; background: #1f2c34; border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+    .toggle-label { font-size: 14px; color: #e9edef; }
+    .toggle-sub { font-size: 11px; color: #8696a0; }
+    .toggle-switch { width: 44px; height: 24px; background: #2a3942; border-radius: 12px; position: relative; cursor: pointer; transition: background 0.2s; border: none; flex-shrink: 0; }
+    .toggle-switch.on { background: #00a884; }
+    .toggle-switch::after { content: ''; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; background: #fff; border-radius: 50%; transition: transform 0.2s; }
+    .toggle-switch.on::after { transform: translateX(20px); }
+
+    /* Reply modal */
+    .reply-modal textarea { min-height: 60px; margin: 12px 0; }
+    .reply-modal .reply-to { font-size: 12px; color: #8696a0; margin-bottom: 8px; }
+    .reply-modal .modal-actions { display: flex; gap: 8px; justify-content: center; }
+    .reply-send { background: #00a884; color: #fff; border: none; border-radius: 20px; padding: 8px 20px; cursor: pointer; font-size: 14px; font-weight: 500; }
+    .reply-send:hover { background: #06cf9c; }
   </style>
 </head>
 <body>
@@ -283,7 +502,7 @@ const HTML = `<!DOCTYPE html>
     <div class="topbar">
       <div class="topbar-avatar">&#x1F4E2;</div>
       <div class="topbar-info">
-        <div class="topbar-title" id="subtitle">Broadcast<span class="mod-badge">PRO</span></div>
+        <div class="topbar-title" id="subtitle">Broadcast<span class="mod-badge">PRO v3</span></div>
         <div class="topbar-sub"><span class="dot" id="statusDot"></span> <span id="statusText">connecting...</span></div>
       </div>
       <div class="topbar-actions">
@@ -295,6 +514,13 @@ const HTML = `<!DOCTYPE html>
       <button class="acc-chip add-chip" onclick="addAccount()" id="addBtn">+ Add</button>
     </div>
 
+    <div class="tab-bar">
+      <button class="tab-btn active" onclick="switchTab('broadcast')" id="tabBroadcast">&#x1F4E2; Broadcast</button>
+      <button class="tab-btn" onclick="switchTab('leads')" id="tabLeads">&#x1F50D; Leads <span class="badge" id="leadBadge" style="display:none">0</span></button>
+      <button class="tab-btn" onclick="switchTab('keywords')" id="tabKeywords">&#x2699; Keywords</button>
+    </div>
+
+    <!-- QR Modal -->
     <div class="modal-overlay" id="qrModal" style="display:none">
       <div class="modal">
         <h3 id="qrTitle">Link Device</h3>
@@ -305,35 +531,108 @@ const HTML = `<!DOCTYPE html>
       </div>
     </div>
 
-    <div class="chat-area">
-      <div class="bubble">
-        <div class="bubble-label" id="msgLabel">Compose message</div>
-        <textarea id="msgInput" oninput="updateCount()" rows="3"></textarea>
-        <div class="char-count"><span id="charCount">0</span> <span id="charLabel">chars</span></div>
-      </div>
-
-      <div class="bubble">
-        <div class="groups-header">
-          <div class="bubble-label" style="margin:0" id="groupsLabel">Groups (0)</div>
-          <div style="display:flex;gap:6px">
-            <button class="wa-link" onclick="selectAll()" id="selectAllBtn">Select all</button>
-            <button class="wa-icon-btn" onclick="loadGroups()" id="refreshBtn">&#x21BB;</button>
-          </div>
-        </div>
-        <div class="groups-list" id="groupsList">
-          <div class="empty">Loading...</div>
+    <!-- Reply Modal -->
+    <div class="modal-overlay" id="replyModal" style="display:none">
+      <div class="modal reply-modal">
+        <h3>Reply via DM</h3>
+        <div class="reply-to" id="replyTo"></div>
+        <textarea id="replyMsg" rows="3" placeholder="Type your DM reply..."></textarea>
+        <div class="modal-actions">
+          <button class="modal-close" onclick="closeReply()">Cancel</button>
+          <button class="reply-send" onclick="sendReply()">Send DM</button>
         </div>
       </div>
-
-      <div id="progressWrap" class="progress" style="display:none">
-        <div class="progress-text" id="progressText">Sending...</div>
-        <div class="progress-bar-wrap"><div class="progress-bar" id="progressBar" style="width:0%"></div></div>
-      </div>
-
-      <div id="result" style="display:none" class="toast"></div>
     </div>
 
-    <div class="bottom-bar">
+    <div class="chat-area">
+      <!-- ═══ BROADCAST TAB ═══ -->
+      <div class="tab-content active" id="panelBroadcast">
+        <div class="bubble">
+          <div class="bubble-label" id="msgLabel">Compose message</div>
+          <textarea id="msgInput" oninput="updateCount()" rows="3"></textarea>
+          <div class="char-count"><span id="charCount">0</span> <span id="charLabel">chars</span></div>
+        </div>
+
+        <div class="bubble">
+          <div class="groups-header">
+            <div class="bubble-label" style="margin:0" id="groupsLabel">Groups (0)</div>
+            <div style="display:flex;gap:6px">
+              <button class="wa-link" onclick="selectAll()" id="selectAllBtn">Select all</button>
+              <button class="wa-icon-btn" onclick="loadGroups()" id="refreshBtn">&#x21BB;</button>
+            </div>
+          </div>
+          <div class="groups-list" id="groupsList">
+            <div class="empty">Loading...</div>
+          </div>
+        </div>
+
+        <div id="progressWrap" class="progress" style="display:none">
+          <div class="progress-text" id="progressText">Sending...</div>
+          <div class="progress-bar-wrap"><div class="progress-bar" id="progressBar" style="width:0%"></div></div>
+        </div>
+
+        <div id="result" style="display:none" class="toast"></div>
+      </div>
+
+      <!-- ═══ LEADS TAB ═══ -->
+      <div class="tab-content" id="panelLeads">
+        <div class="stats-row" id="leadStats">
+          <div class="stat-card"><div class="stat-num" id="statTotal">0</div><div class="stat-label">Total</div></div>
+          <div class="stat-card"><div class="stat-num" id="statToday">0</div><div class="stat-label">Today</div></div>
+          <div class="stat-card"><div class="stat-num" id="statWeek">0</div><div class="stat-label">This Week</div></div>
+        </div>
+
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <div class="bubble-label" style="margin:0">Live Leads</div>
+          <div style="display:flex;gap:6px">
+            <button class="wa-icon-btn" onclick="exportLeads()" title="Export CSV">&#x1F4E5; CSV</button>
+            <button class="wa-icon-btn" onclick="dismissAllLeads()">Clear all</button>
+            <button class="wa-icon-btn" onclick="loadLeads()" id="refreshLeadsBtn">&#x21BB;</button>
+          </div>
+        </div>
+
+        <div id="leadsList"></div>
+      </div>
+
+      <!-- ═══ KEYWORDS TAB ═══ -->
+      <div class="tab-content" id="panelKeywords">
+        <div class="toggle-row">
+          <div>
+            <div class="toggle-label">Lead Scanner</div>
+            <div class="toggle-sub">Scan group messages for event keywords</div>
+          </div>
+          <button class="toggle-switch on" id="scannerToggle" onclick="toggleScanner()"></button>
+        </div>
+
+        <div class="bubble">
+          <div class="kw-section">
+            <div class="kw-section-title">English Keywords</div>
+            <div class="kw-tags" id="kwTagsEn"></div>
+            <div class="kw-add-row">
+              <input type="text" id="kwInputEn" placeholder="Add keyword..." onkeydown="if(event.key==='Enter')addKeyword('en')" />
+              <button class="kw-add-btn" onclick="addKeyword('en')">+ Add</button>
+            </div>
+          </div>
+
+          <div class="kw-section" style="margin-top:16px">
+            <div class="kw-section-title">Hebrew Keywords</div>
+            <div class="kw-tags" id="kwTagsHe"></div>
+            <div class="kw-add-row">
+              <input type="text" id="kwInputHe" placeholder="...\u05D4\u05D5\u05E1\u05E3 \u05DE\u05D9\u05DC\u05D4" dir="rtl" onkeydown="if(event.key==='Enter')addKeyword('he')" />
+              <button class="kw-add-btn" onclick="addKeyword('he')">+ Add</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="bubble" style="margin-top:8px">
+          <div class="bubble-label">Top Keywords</div>
+          <div id="topKeywords" class="empty">No data yet</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Bottom bar (broadcast tab only) -->
+    <div class="bottom-bar" id="bottomBar">
       <div class="send-info" id="sendLabel">Select groups & write a message</div>
       <button class="send-btn" id="sendBtn" onclick="send()" disabled>&#x27A4;</button>
     </div>
@@ -344,20 +643,17 @@ const HTML = `<!DOCTYPE html>
     let selected = new Set();
     let accountsList = [];
     let activeQrAccount = null;
+    let currentTab = 'broadcast';
+    let leadCount = 0;
+    let kwData = { en: [], he: [] };
+    let replyLeadId = null;
+    let leadPollTimer = null;
     let lang = localStorage.getItem('wa-lang') || 'en';
 
     const i18n = {
       en: {
         statusOnline: function(n, t) { return n + '/' + t + ' online'; },
         statusNone: 'no accounts',
-        statusServerDown: 'server down',
-        qrTitle: 'Link Device',
-        qrInstructions: 'Open WhatsApp > Linked Devices > Link a Device',
-        qrLoading: 'Loading...',
-        qrConnected: 'Connected! Close this.',
-        qrScan: 'Scan with WhatsApp',
-        qrWaiting: 'Waiting...',
-        qrClose: 'Close',
         msgLabel: 'Compose message',
         placeholder: 'Type your broadcast message...',
         charLabel: 'chars',
@@ -376,46 +672,49 @@ const HTML = `<!DOCTYPE html>
         sendInfo: 'Select groups & write a message',
         sendReady: function(n) { return '<strong>' + n + '</strong> groups ready'; },
         addAccount: '+ Add',
+        qrTitle: 'Link Device',
+        qrInstructions: 'Open WhatsApp > Linked Devices > Link a Device',
+        qrLoading: 'Loading...',
+        qrConnected: 'Connected! Close this.',
+        qrScan: 'Scan with WhatsApp',
+        qrWaiting: 'Waiting...',
+        qrClose: 'Close',
+        noLeads: 'No leads detected yet. Scanner is listening...',
       },
       he: {
-        statusOnline: function(n, t) { return n + '/' + t + ' ' + String.fromCharCode(1502, 1495, 1493, 1489, 1512, 1497, 1501); },
-        statusNone: String.fromCharCode(1488, 1497, 1503, 32, 1495, 1513, 1489, 1493, 1504, 1493, 1514),
-        statusServerDown: String.fromCharCode(1513, 1512, 1514, 32, 1500, 1488, 32, 1494, 1502, 1497, 1503),
-        qrTitle: String.fromCharCode(1511, 1497, 1513, 1493, 1512, 32, 1502, 1499, 1513, 1497, 1512),
-        qrInstructions: String.fromCharCode(1508, 1514, 1495, 32) + 'WhatsApp > ' + String.fromCharCode(1492, 1514, 1511, 1504, 1497, 1501, 32, 1502, 1511, 1493, 1513, 1512, 1497, 1501) + ' > ' + String.fromCharCode(1511, 1513, 1512, 32, 1492, 1514, 1511, 1503),
-        qrLoading: String.fromCharCode(1496, 1493, 1506, 1503) + '...',
-        qrConnected: String.fromCharCode(1502, 1495, 1493, 1489, 1512, 33),
-        qrScan: String.fromCharCode(1505, 1512, 1493, 1511, 32, 1506, 1501, 32) + 'WhatsApp',
-        qrWaiting: String.fromCharCode(1502, 1502, 1514, 1497, 1503) + '...',
-        qrClose: String.fromCharCode(1505, 1490, 1493, 1512),
-        msgLabel: String.fromCharCode(1499, 1514, 1493, 1489, 32, 1492, 1493, 1491, 1506, 1492),
-        placeholder: String.fromCharCode(1499, 1514, 1489, 1493, 32, 1488, 1514, 32, 1492, 1492, 1493, 1491, 1506, 1492) + '...',
-        charLabel: String.fromCharCode(1514, 1493, 1493, 1497, 1501),
-        groupsLabel: function(n) { return String.fromCharCode(1511, 1489, 1493, 1510, 1493, 1514) + ' (' + n + ')'; },
-        selectAll: String.fromCharCode(1489, 1495, 1512, 32, 1492, 1499, 1500),
-        groupsLoading: String.fromCharCode(1496, 1493, 1506, 1503) + '...',
-        groupsEmpty: String.fromCharCode(1488, 1497, 1503, 32, 1511, 1489, 1493, 1510, 1493, 1514),
-        groupsError: String.fromCharCode(1513, 1490, 1497, 1488, 1492),
-        members: String.fromCharCode(1495, 1489, 1512, 1497, 1501),
-        sending: String.fromCharCode(1513, 1493, 1500, 1495) + '...',
-        sendingProgress: function(done, total) { return String.fromCharCode(1513, 1493, 1500, 1495) + ' ' + done + '/' + total + '...'; },
-        done: String.fromCharCode(1492, 1493, 1513, 1500, 1501) + '!',
-        successMsg: function(n) { return String.fromCharCode(1504, 1513, 1500, 1495, 32, 1500) + '-' + n + ' ' + String.fromCharCode(1511, 1489, 1493, 1510, 1493, 1514); },
-        partialMsg: function(sent, failed) { return String.fromCharCode(1504, 1513, 1500, 1495) + ': ' + sent + ' | ' + String.fromCharCode(1504, 1499, 1513, 1500) + ': ' + failed; },
-        errorMsg: function(msg) { return String.fromCharCode(1513, 1490, 1497, 1488, 1492) + ': ' + msg; },
-        sendInfo: String.fromCharCode(1489, 1495, 1512, 32, 1511, 1489, 1493, 1510, 1493, 1514, 32, 1493, 1499, 1514, 1489, 32, 1492, 1493, 1491, 1506, 1492),
-        sendReady: function(n) { return '<strong>' + n + '</strong> ' + String.fromCharCode(1511, 1489, 1493, 1510, 1493, 1514, 32, 1502, 1493, 1499, 1504, 1493, 1514); },
-        addAccount: '+ ' + String.fromCharCode(1492, 1493, 1505, 1507),
+        statusOnline: function(n, t) { return n + '/' + t + ' \\u05DE\\u05D7\\u05D5\\u05D1\\u05E8\\u05D9\\u05DD'; },
+        statusNone: '\\u05D0\\u05D9\\u05DF \\u05D7\\u05E9\\u05D1\\u05D5\\u05E0\\u05D5\\u05EA',
+        msgLabel: '\\u05DB\\u05EA\\u05D5\\u05D1 \\u05D4\\u05D5\\u05D3\\u05E2\\u05D4',
+        placeholder: '\\u05DB\\u05EA\\u05D1\\u05D5 \\u05D0\\u05EA \\u05D4\\u05D4\\u05D5\\u05D3\\u05E2\\u05D4...',
+        charLabel: '\\u05EA\\u05D5\\u05D5\\u05D9\\u05DD',
+        groupsLabel: function(n) { return '\\u05E7\\u05D1\\u05D5\\u05E6\\u05D5\\u05EA (' + n + ')'; },
+        selectAll: '\\u05D1\\u05D7\\u05E8 \\u05D4\\u05DB\\u05DC',
+        groupsLoading: '\\u05D8\\u05D5\\u05E2\\u05DF...',
+        groupsEmpty: '\\u05D0\\u05D9\\u05DF \\u05E7\\u05D1\\u05D5\\u05E6\\u05D5\\u05EA',
+        groupsError: '\\u05E9\\u05D2\\u05D9\\u05D0\\u05D4',
+        members: '\\u05D7\\u05D1\\u05E8\\u05D9\\u05DD',
+        sending: '\\u05E9\\u05D5\\u05DC\\u05D7...',
+        sendingProgress: function(done, total) { return '\\u05E9\\u05D5\\u05DC\\u05D7 ' + done + '/' + total + '...'; },
+        done: '\\u05D4\\u05D5\\u05E9\\u05DC\\u05DD!',
+        successMsg: function(n) { return '\\u05E0\\u05E9\\u05DC\\u05D7 \\u05DC-' + n + ' \\u05E7\\u05D1\\u05D5\\u05E6\\u05D5\\u05EA'; },
+        partialMsg: function(sent, failed) { return '\\u05E0\\u05E9\\u05DC\\u05D7: ' + sent + ' | \\u05E0\\u05DB\\u05E9\\u05DC: ' + failed; },
+        errorMsg: function(msg) { return '\\u05E9\\u05D2\\u05D9\\u05D0\\u05D4: ' + msg; },
+        sendInfo: '\\u05D1\\u05D7\\u05E8 \\u05E7\\u05D1\\u05D5\\u05E6\\u05D5\\u05EA \\u05D5\\u05DB\\u05EA\\u05D1 \\u05D4\\u05D5\\u05D3\\u05E2\\u05D4',
+        sendReady: function(n) { return '<strong>' + n + '</strong> \\u05E7\\u05D1\\u05D5\\u05E6\\u05D5\\u05EA \\u05DE\\u05D5\\u05DB\\u05E0\\u05D5\\u05EA'; },
+        addAccount: '+ \\u05D4\\u05D5\\u05E1\\u05E3',
+        qrTitle: '\\u05E7\\u05D9\\u05E9\\u05D5\\u05E8 \\u05DE\\u05DB\\u05E9\\u05D9\\u05E8',
+        qrInstructions: '\\u05E4\\u05EA\\u05D7 WhatsApp > \\u05D4\\u05EA\\u05E7\\u05E0\\u05D9\\u05DD \\u05DE\\u05E7\\u05D5\\u05E9\\u05E8\\u05D9\\u05DD > \\u05E7\\u05E9\\u05E8 \\u05D4\\u05EA\\u05E7\\u05DF',
+        qrLoading: '\\u05D8\\u05D5\\u05E2\\u05DF...',
+        qrConnected: '\\u05DE\\u05D7\\u05D5\\u05D1\\u05E8!',
+        qrScan: '\\u05E1\\u05E8\\u05D5\\u05E7 \\u05E2\\u05DD WhatsApp',
+        qrWaiting: '\\u05DE\\u05DE\\u05EA\\u05D9\\u05DF...',
+        qrClose: '\\u05E1\\u05D2\\u05D5\\u05E8',
+        noLeads: '\\u05E2\\u05D3\\u05D9\\u05D9\\u05DF \\u05D0\\u05D9\\u05DF \\u05DC\\u05D9\\u05D3\\u05D9\\u05DD. \\u05D4\\u05E1\\u05D5\\u05E8\\u05E7 \\u05DE\\u05D0\\u05D6\\u05D9\\u05DF...',
       }
     };
 
     function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-
-    function t(key) {
-      var val = i18n[lang][key];
-      if (typeof val === 'function') return val.apply(null, Array.prototype.slice.call(arguments, 1));
-      return val;
-    }
+    function t(key) { var val = i18n[lang][key]; if (typeof val === 'function') return val.apply(null, Array.prototype.slice.call(arguments, 1)); return val || key; }
 
     function applyLang() {
       var isRTL = lang === 'he';
@@ -434,10 +733,18 @@ const HTML = `<!DOCTYPE html>
       renderGroups();
     }
 
-    function toggleLang() {
-      lang = lang === 'en' ? 'he' : 'en';
-      localStorage.setItem('wa-lang', lang);
-      applyLang();
+    function toggleLang() { lang = lang === 'en' ? 'he' : 'en'; localStorage.setItem('wa-lang', lang); applyLang(); }
+
+    // ── Tabs ──
+    function switchTab(tab) {
+      currentTab = tab;
+      document.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
+      document.querySelectorAll('.tab-content').forEach(function(p) { p.classList.remove('active'); });
+      document.getElementById('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.add('active');
+      document.getElementById('panel' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.add('active');
+      document.getElementById('bottomBar').style.display = tab === 'broadcast' ? 'flex' : 'none';
+      if (tab === 'leads') { loadLeads(); loadLeadStats(); }
+      if (tab === 'keywords') { loadKeywords(); }
     }
 
     // ── Accounts ──
@@ -459,68 +766,37 @@ const HTML = `<!DOCTYPE html>
       try {
         var r = await fetch('/api/accounts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
         var d = await r.json();
-        if (d.id) {
-          await refreshAccounts();
-          openQR(d.id);
-        }
+        if (d.id) { await refreshAccounts(); openQR(d.id); }
       } catch (e) { console.error('Add account error:', e); }
     }
 
     async function removeAccount(id) {
       var a = accountsList.find(function(x) { return x.id === id; });
-      var label = a ? a.name : id;
-      if (!confirm('Remove ' + label + '? This disconnects the WhatsApp session.')) return;
-      try {
-        await fetch('/api/accounts?id=' + encodeURIComponent(id), { method: 'DELETE' });
-        await refreshAccounts();
-        loadGroups();
-      } catch (e) { console.error('Remove error:', e); }
+      if (!confirm('Remove ' + (a ? a.name : id) + '?')) return;
+      try { await fetch('/api/accounts?id=' + encodeURIComponent(id), { method: 'DELETE' }); await refreshAccounts(); loadGroups(); } catch (e) {}
     }
 
-    function connectAccount(id) {
-      var a = accountsList.find(function(x) { return x.id === id; });
-      if (a && a.status !== 'ready') openQR(id);
-    }
+    function connectAccount(id) { var a = accountsList.find(function(x) { return x.id === id; }); if (a && a.status !== 'ready') openQR(id); }
 
     async function refreshAccounts() {
-      try {
-        var r = await fetch('/api/accounts');
-        var d = await r.json();
-        accountsList = d.accounts || [];
-        renderAccounts();
-        updateTopStatus();
-      } catch (e) {}
+      try { var r = await fetch('/api/accounts'); var d = await r.json(); accountsList = d.accounts || []; renderAccounts(); updateTopStatus(); } catch (e) {}
     }
 
     function updateTopStatus() {
       var online = accountsList.filter(function(a) { return a.status === 'ready'; }).length;
-      var dot = document.getElementById('statusDot');
-      var txt = document.getElementById('statusText');
-      if (accountsList.length === 0) {
-        dot.className = 'dot';
-        txt.textContent = t('statusNone');
-      } else {
-        dot.className = online > 0 ? 'dot online' : 'dot';
-        txt.textContent = t('statusOnline', online, accountsList.length);
-      }
+      document.getElementById('statusDot').className = online > 0 ? 'dot online' : 'dot';
+      document.getElementById('statusText').textContent = accountsList.length === 0 ? t('statusNone') : t('statusOnline', online, accountsList.length);
     }
 
     // ── Groups ──
     async function loadGroups() {
       document.getElementById('groupsList').innerHTML = '<div class="empty">' + t('groupsLoading') + '</div>';
-      try {
-        var r = await fetch('/api/groups');
-        var d = await r.json();
-        groups = d.groups || [];
-        renderGroups();
-      } catch (e) {
-        document.getElementById('groupsList').innerHTML = '<div class="empty">' + t('groupsError') + '</div>';
-      }
+      try { var r = await fetch('/api/groups'); var d = await r.json(); groups = d.groups || []; renderGroups(); }
+      catch (e) { document.getElementById('groupsList').innerHTML = '<div class="empty">' + t('groupsError') + '</div>'; }
     }
 
     function renderGroups() {
       var el = document.getElementById('groupsList');
-      // Clean stale selections
       var validIds = new Set(groups.map(function(g) { return g.id; }));
       selected.forEach(function(id) { if (!validIds.has(id)) selected.delete(id); });
       if (!groups.length) { el.innerHTML = '<div class="empty">' + t('groupsEmpty') + '</div>'; return; }
@@ -536,69 +812,32 @@ const HTML = `<!DOCTYPE html>
       updateSendBtn();
     }
 
-    function toggle(id) {
-      if (selected.has(id)) selected.delete(id); else selected.add(id);
-      renderGroups();
-      document.getElementById('groupsLabel').innerHTML = t('groupsLabel', selected.size);
-    }
-
-    function selectAll() {
-      if (selected.size === groups.length) { selected.clear(); } else { groups.forEach(function(g) { selected.add(g.id); }); }
-      renderGroups();
-      document.getElementById('groupsLabel').innerHTML = t('groupsLabel', selected.size);
-    }
-
-    function updateCount() {
-      document.getElementById('charCount').textContent = document.getElementById('msgInput').value.length;
-      updateSendBtn();
-    }
-
-    function updateSendBtn() {
-      var msg = document.getElementById('msgInput').value.trim();
-      var ready = msg && selected.size > 0;
-      document.getElementById('sendBtn').disabled = !ready;
-      document.getElementById('sendLabel').innerHTML = ready ? t('sendReady', selected.size) : t('sendInfo');
-    }
+    function toggle(id) { if (selected.has(id)) selected.delete(id); else selected.add(id); renderGroups(); document.getElementById('groupsLabel').innerHTML = t('groupsLabel', selected.size); }
+    function selectAll() { if (selected.size === groups.length) selected.clear(); else groups.forEach(function(g) { selected.add(g.id); }); renderGroups(); document.getElementById('groupsLabel').innerHTML = t('groupsLabel', selected.size); }
+    function updateCount() { document.getElementById('charCount').textContent = document.getElementById('msgInput').value.length; updateSendBtn(); }
+    function updateSendBtn() { var msg = document.getElementById('msgInput').value.trim(); var ready = msg && selected.size > 0; document.getElementById('sendBtn').disabled = !ready; document.getElementById('sendLabel').innerHTML = ready ? t('sendReady', selected.size) : t('sendInfo'); }
 
     // ── Send ──
     async function send() {
       var msg = document.getElementById('msgInput').value.trim();
       if (!msg || selected.size === 0) return;
       var ids = Array.from(selected);
-
       document.getElementById('sendBtn').disabled = true;
       document.getElementById('sendLabel').innerHTML = '<span class="spinner"></span> ' + t('sending');
       document.getElementById('result').style.display = 'none';
       document.getElementById('progressWrap').style.display = 'block';
       document.getElementById('progressBar').style.width = '0%';
       document.getElementById('progressText').textContent = t('sendingProgress', 0, ids.length);
-
       try {
-        var r = await fetch('/api/broadcast', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chatIds: ids, message: msg })
-        });
+        var r = await fetch('/api/broadcast', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chatIds: ids, message: msg }) });
         var d = await r.json();
         document.getElementById('progressBar').style.width = '100%';
         document.getElementById('progressText').textContent = t('done');
-
         var res = document.getElementById('result');
         res.style.display = 'block';
-        if (d.failed === 0) {
-          res.className = 'toast success';
-          res.textContent = t('successMsg', d.sent);
-        } else {
-          res.className = 'toast error';
-          res.textContent = t('partialMsg', d.sent, d.failed);
-        }
-      } catch (e) {
-        var res2 = document.getElementById('result');
-        res2.style.display = 'block';
-        res2.className = 'toast error';
-        res2.textContent = t('errorMsg', e.message);
-      }
-
+        if (d.failed === 0) { res.className = 'toast success'; res.textContent = t('successMsg', d.sent); }
+        else { res.className = 'toast error'; res.textContent = t('partialMsg', d.sent, d.failed); }
+      } catch (e) { var res2 = document.getElementById('result'); res2.style.display = 'block'; res2.className = 'toast error'; res2.textContent = t('errorMsg', e.message); }
       document.getElementById('progressWrap').style.display = 'none';
       document.getElementById('sendBtn').disabled = false;
       document.getElementById('sendLabel').textContent = t('sendInfo');
@@ -606,50 +845,199 @@ const HTML = `<!DOCTYPE html>
 
     // ── QR Modal ──
     var qrPollTimer = null;
-
-    function openQR(accountId) {
-      activeQrAccount = accountId;
-      document.getElementById('qrModal').style.display = 'flex';
-      document.getElementById('qrWrap').style.display = 'none';
-      document.getElementById('qrStatusMsg').textContent = t('qrLoading');
-      pollQR();
-      qrPollTimer = setInterval(pollQR, 3000);
-    }
-
-    function closeQR() {
-      document.getElementById('qrModal').style.display = 'none';
-      if (qrPollTimer) { clearInterval(qrPollTimer); qrPollTimer = null; }
-      activeQrAccount = null;
-    }
-
+    function openQR(accountId) { activeQrAccount = accountId; document.getElementById('qrModal').style.display = 'flex'; document.getElementById('qrWrap').style.display = 'none'; document.getElementById('qrStatusMsg').textContent = t('qrLoading'); pollQR(); qrPollTimer = setInterval(pollQR, 3000); }
+    function closeQR() { document.getElementById('qrModal').style.display = 'none'; if (qrPollTimer) { clearInterval(qrPollTimer); qrPollTimer = null; } activeQrAccount = null; }
     async function pollQR() {
       if (!activeQrAccount) return;
       try {
         var r = await fetch('/api/qr?account=' + encodeURIComponent(activeQrAccount));
         var d = await r.json();
-        if (d.status === 'ready') {
-          document.getElementById('qrWrap').style.display = 'none';
-          document.getElementById('qrStatusMsg').textContent = t('qrConnected');
-          if (qrPollTimer) { clearInterval(qrPollTimer); qrPollTimer = null; }
-          refreshAccounts();
-          loadGroups();
-        } else if (d.qrDataUrl) {
-          document.getElementById('qrImg').src = d.qrDataUrl;
-          document.getElementById('qrWrap').style.display = 'inline-block';
-          document.getElementById('qrStatusMsg').textContent = t('qrScan');
-        } else {
-          document.getElementById('qrStatusMsg').textContent = d.status || t('qrWaiting');
+        if (d.status === 'ready') { document.getElementById('qrWrap').style.display = 'none'; document.getElementById('qrStatusMsg').textContent = t('qrConnected'); if (qrPollTimer) { clearInterval(qrPollTimer); qrPollTimer = null; } refreshAccounts(); loadGroups(); }
+        else if (d.qrDataUrl) { document.getElementById('qrImg').src = d.qrDataUrl; document.getElementById('qrWrap').style.display = 'inline-block'; document.getElementById('qrStatusMsg').textContent = t('qrScan'); }
+        else { document.getElementById('qrStatusMsg').textContent = d.status || t('qrWaiting'); }
+      } catch (e) { document.getElementById('qrStatusMsg').textContent = t('errorMsg', e.message); }
+    }
+
+    // ── Leads ──
+    function highlightMsg(msg, keywords) {
+      var escaped = esc(msg);
+      keywords.forEach(function(kw) {
+        var re = new RegExp('(' + kw.replace(/[.*+?^\${}()|[\\]\\\\]/g, '\\\\$&') + ')', 'gi');
+        escaped = escaped.replace(re, '<span class="kw-match">$1</span>');
+      });
+      return escaped;
+    }
+
+    function timeAgo(ts) {
+      var diff = (Date.now() - new Date(ts).getTime()) / 1000;
+      if (diff < 60) return 'just now';
+      if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+      if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+      return Math.floor(diff / 86400) + 'd ago';
+    }
+
+    async function loadLeads() {
+      try {
+        var r = await fetch('/api/leads');
+        var d = await r.json();
+        var list = d.leads || [];
+        leadCount = list.length;
+        updateLeadBadge();
+        var el = document.getElementById('leadsList');
+        if (!list.length) { el.innerHTML = '<div class="empty">&#x1F50D; ' + t('noLeads') + '</div>'; return; }
+        el.innerHTML = list.map(function(l) {
+          return '<div class="lead-card" id="lead-' + l.id + '">'
+            + '<div class="lead-header"><div><div class="lead-sender">' + esc(l.senderName) + '</div><div class="lead-group">&#x1F4AC; ' + esc(l.groupName) + '</div></div>'
+            + '<div class="lead-time">' + timeAgo(l.timestamp) + '</div></div>'
+            + '<div class="lead-msg">' + highlightMsg(l.message, l.matchedKeywords) + '</div>'
+            + '<div class="lead-keywords">' + l.matchedKeywords.map(function(kw) { return '<span class="lead-kw-tag">' + esc(kw) + '</span>'; }).join('') + '</div>'
+            + '<div class="lead-actions">'
+            + '<button class="lead-btn reply" onclick="openReply(\\'' + l.id + '\\',\\'' + esc(l.senderName).replace(/'/g, "\\\\'") + '\\')">&#x1F4AC; Reply DM</button>'
+            + '<button class="lead-btn dismiss" onclick="dismissLead(\\'' + l.id + '\\')">Dismiss</button>'
+            + '</div></div>';
+        }).join('');
+      } catch (e) { console.error('Load leads error:', e); }
+    }
+
+    async function loadLeadStats() {
+      try {
+        var r = await fetch('/api/leads/stats');
+        var d = await r.json();
+        document.getElementById('statTotal').textContent = d.total || 0;
+        document.getElementById('statToday').textContent = d.today || 0;
+        document.getElementById('statWeek').textContent = d.week || 0;
+        // Top keywords
+        var tkEl = document.getElementById('topKeywords');
+        if (d.topKeywords && d.topKeywords.length) {
+          tkEl.innerHTML = d.topKeywords.map(function(k) { return '<span class="lead-kw-tag" style="margin:2px">' + esc(k.keyword) + ' (' + k.count + ')</span>'; }).join('');
+          tkEl.className = '';
         }
-      } catch (e) {
-        document.getElementById('qrStatusMsg').textContent = t('errorMsg', e.message);
-      }
+      } catch (e) {}
+    }
+
+    function updateLeadBadge() {
+      var badge = document.getElementById('leadBadge');
+      if (leadCount > 0) { badge.style.display = 'inline-block'; badge.textContent = leadCount > 99 ? '99+' : leadCount; }
+      else { badge.style.display = 'none'; }
+    }
+
+    async function dismissLead(id) {
+      try {
+        await fetch('/api/leads/dismiss', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: id }) });
+        var el = document.getElementById('lead-' + id);
+        if (el) el.remove();
+        leadCount = Math.max(0, leadCount - 1);
+        updateLeadBadge();
+      } catch (e) {}
+    }
+
+    async function dismissAllLeads() {
+      if (!confirm('Dismiss all leads?')) return;
+      try { await fetch('/api/leads/dismiss-all', { method: 'POST' }); leadCount = 0; updateLeadBadge(); loadLeads(); loadLeadStats(); } catch (e) {}
+    }
+
+    function openReply(leadId, senderName) {
+      replyLeadId = leadId;
+      document.getElementById('replyTo').textContent = 'To: ' + senderName;
+      document.getElementById('replyMsg').value = '';
+      document.getElementById('replyModal').style.display = 'flex';
+      document.getElementById('replyMsg').focus();
+    }
+
+    function closeReply() { document.getElementById('replyModal').style.display = 'none'; replyLeadId = null; }
+
+    async function sendReply() {
+      var msg = document.getElementById('replyMsg').value.trim();
+      if (!msg || !replyLeadId) return;
+      try {
+        var r = await fetch('/api/leads/reply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ leadId: replyLeadId, message: msg }) });
+        var d = await r.json();
+        if (d.ok) { closeReply(); alert('DM sent!'); }
+        else { alert('Error: ' + (d.error || 'Unknown')); }
+      } catch (e) { alert('Error: ' + e.message); }
+    }
+
+    async function exportLeads() {
+      try {
+        var r = await fetch('/api/leads/export');
+        var text = await r.text();
+        var blob = new Blob([text], { type: 'text/csv' });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url; a.download = 'leads-' + new Date().toISOString().slice(0, 10) + '.csv';
+        a.click(); URL.revokeObjectURL(url);
+      } catch (e) { alert('Export error: ' + e.message); }
+    }
+
+    // ── Keywords ──
+    async function loadKeywords() {
+      try {
+        var r = await fetch('/api/keywords');
+        var d = await r.json();
+        kwData = d.keywords || { en: [], he: [] };
+        var toggle = document.getElementById('scannerToggle');
+        toggle.className = d.scannerEnabled ? 'toggle-switch on' : 'toggle-switch';
+        renderKeywords();
+      } catch (e) {}
+    }
+
+    function renderKeywords() {
+      ['en', 'he'].forEach(function(lang) {
+        var el = document.getElementById('kwTags' + lang.charAt(0).toUpperCase() + lang.slice(1));
+        el.innerHTML = (kwData[lang] || []).map(function(kw) {
+          return '<span class="kw-tag">' + esc(kw) + '<button class="kw-x" onclick="removeKeyword(\\'' + lang + '\\',\\'' + esc(kw).replace(/'/g, "\\\\'") + '\\')">&times;</button></span>';
+        }).join('');
+      });
+    }
+
+    async function addKeyword(lang) {
+      var input = document.getElementById('kwInput' + lang.charAt(0).toUpperCase() + lang.slice(1));
+      var val = input.value.trim();
+      if (!val) return;
+      kwData[lang] = kwData[lang] || [];
+      if (kwData[lang].indexOf(val) === -1) kwData[lang].push(val);
+      input.value = '';
+      renderKeywords();
+      await saveKeywords();
+    }
+
+    async function removeKeyword(lang, kw) {
+      kwData[lang] = (kwData[lang] || []).filter(function(k) { return k !== kw; });
+      renderKeywords();
+      await saveKeywords();
+    }
+
+    async function toggleScanner() {
+      var toggle = document.getElementById('scannerToggle');
+      var isOn = toggle.classList.contains('on');
+      toggle.className = isOn ? 'toggle-switch' : 'toggle-switch on';
+      try { await fetch('/api/keywords', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ scannerEnabled: !isOn }) }); } catch (e) {}
+    }
+
+    async function saveKeywords() {
+      try { await fetch('/api/keywords', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ keywords: kwData }) }); } catch (e) {}
+    }
+
+    // ── Poll leads in background ──
+    async function pollLeads() {
+      try {
+        var r = await fetch('/api/leads');
+        var d = await r.json();
+        var newCount = (d.leads || []).length;
+        if (newCount !== leadCount) {
+          leadCount = newCount;
+          updateLeadBadge();
+          if (currentTab === 'leads') { loadLeads(); loadLeadStats(); }
+        }
+      } catch (e) {}
     }
 
     // Init
     applyLang();
     refreshAccounts();
     loadGroups();
-    setInterval(function() { refreshAccounts(); }, 15000);
+    setInterval(refreshAccounts, 15000);
+    setInterval(pollLeads, 5000);
   </script>
 </body>
 </html>`;
@@ -677,7 +1065,7 @@ const server = http.createServer(async (req, res) => {
   const params = parsed.searchParams;
 
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
@@ -686,53 +1074,64 @@ const server = http.createServer(async (req, res) => {
     res.end(HTML); return;
   }
 
-  if (p === '/api/accounts' && req.method === 'GET') {
-    json(res, handleAccounts()); return;
-  }
-
+  // Existing routes
+  if (p === '/api/accounts' && req.method === 'GET') { json(res, handleAccounts()); return; }
   if (p === '/api/accounts' && req.method === 'POST') {
-    try {
-      const body = await readBody(req);
-      const d = await handleCreateAccount(body ? JSON.parse(body) : {});
-      json(res, d);
-    } catch (e) { json(res, { error: e.message }, 500); }
-    return;
+    try { const body = await readBody(req); json(res, await handleCreateAccount(body ? JSON.parse(body) : {})); }
+    catch (e) { json(res, { error: e.message }, 500); } return;
   }
-
   if (p === '/api/accounts' && req.method === 'DELETE') {
     const id = params.get('id');
     if (!id) { json(res, { error: 'Missing id' }, 400); return; }
     json(res, handleDeleteAccount(id)); return;
   }
-
   if (p === '/api/status') {
     const online = [...accounts.values()].filter(a => a.status === 'ready').length;
     json(res, { status: online > 0 ? 'ready' : 'disconnected', accounts: accounts.size, online }); return;
   }
-
   if (p === '/api/qr') {
     const id = params.get('account');
     if (!id) { json(res, { status: 'missing account param' }, 400); return; }
     json(res, handleQR(id)); return;
   }
-
-  if (p === '/api/groups') {
-    json(res, handleGroups()); return;
+  if (p === '/api/groups') { json(res, handleGroups()); return; }
+  if (p === '/api/broadcast' && req.method === 'POST') {
+    try { const body = await readBody(req); json(res, await handleBroadcast(JSON.parse(body))); }
+    catch (e) { json(res, { error: e.message }, 500); } return;
   }
 
-  if (p === '/api/broadcast' && req.method === 'POST') {
-    try {
-      const body = await readBody(req);
-      const d = await handleBroadcast(JSON.parse(body));
-      json(res, d);
-    } catch (e) { json(res, { error: e.message }, 500); }
-    return;
+  // Lead routes
+  if (p === '/api/leads' && req.method === 'GET') {
+    json(res, handleGetLeads(params.get('since'))); return;
+  }
+  if (p === '/api/leads/stats') { json(res, handleLeadStats()); return; }
+  if (p === '/api/leads/dismiss' && req.method === 'POST') {
+    try { const body = await readBody(req); json(res, handleDismissLead(JSON.parse(body).id)); }
+    catch (e) { json(res, { error: e.message }, 500); } return;
+  }
+  if (p === '/api/leads/dismiss-all' && req.method === 'POST') { json(res, handleDismissAll()); return; }
+  if (p === '/api/leads/reply' && req.method === 'POST') {
+    try { const body = await readBody(req); json(res, await handleReplyToLead(JSON.parse(body))); }
+    catch (e) { json(res, { error: e.message }, 500); } return;
+  }
+  if (p === '/api/leads/export') {
+    const csv = handleExportLeads();
+    res.writeHead(200, { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="leads.csv"' });
+    res.end(csv); return;
+  }
+
+  // Keyword routes
+  if (p === '/api/keywords' && req.method === 'GET') { json(res, handleGetKeywords()); return; }
+  if (p === '/api/keywords' && req.method === 'PUT') {
+    try { const body = await readBody(req); json(res, handleUpdateKeywords(JSON.parse(body))); }
+    catch (e) { json(res, { error: e.message }, 500); } return;
   }
 
   res.writeHead(404); res.end('Not found');
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('WhatsApp Broadcast Pro running on port ' + PORT);
+  console.log('WhatsApp Broadcast Pro v3 running on port ' + PORT);
   console.log('Accounts loaded: ' + accounts.size);
+  console.log('Scanner: ' + (scannerEnabled ? 'ON' : 'OFF') + ' | Keywords: ' + keywords.en.length + ' EN, ' + keywords.he.length + ' HE');
 });
